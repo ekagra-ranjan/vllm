@@ -570,8 +570,8 @@ class Scheduler(SchedulerInterface):
 
         new_running: list[Request] = []
         outputs: list[EngineCoreOutput] = []
-        spec_decoding_stats: Optional[SpecDecodingStats] = None
-        # spec_decoding_stats = self.spec_decoding_stats
+        # spec_decoding_stats: Optional[SpecDecodingStats] = None
+        spec_decoding_stats = self.spec_decoding_stats
 
         # NOTE(woosuk): As len(self.running) can be up to 1K or more, the below
         # loop can be a performance bottleneck. We should do our best to avoid
