@@ -2,7 +2,7 @@
 
 from collections.abc import Mapping
 from copy import copy
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, Union, Tuple
 
 from typing_extensions import TypeVar
 
@@ -28,6 +28,7 @@ from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.engine.processor import Processor
 from vllm.v1.executor.abstract import Executor
+from vllm.v1.metrics.stats import SchedulerStats
 
 logger = init_logger(__name__)
 
@@ -92,7 +93,7 @@ class LLMEngine:
             asyncio_mode=False,
             vllm_config=vllm_config,
             executor_class=executor_class,
-            log_stats=False,  # FIXME: implement
+            log_stats=False,
         )
 
         if not multiprocess_mode:
@@ -211,7 +212,7 @@ class LLMEngine:
             # Add the request to EngineCore.
             self.engine_core.add_request(child_request)
 
-    def step(self) -> list[RequestOutput]:
+    def step(self) -> Tuple[list[RequestOutput], Optional[SchedulerStats]]:
 
         if self.should_execute_dummy_batch:
             self.should_execute_dummy_batch = False
@@ -219,6 +220,7 @@ class LLMEngine:
             return []
 
         # 1) Get EngineCoreOutput from the EngineCore.
+        # import pdb; pdb.set_trace() # REMOVE
         outputs = self.engine_core.get_output()
 
         # 2) Process EngineCoreOutputs.
@@ -228,7 +230,7 @@ class LLMEngine:
         # 3) Abort any reqs that finished due to stop strings.
         self.engine_core.abort_requests(processed_outputs.reqs_to_abort)
 
-        return processed_outputs.request_outputs
+        return processed_outputs.request_outputs, outputs.scheduler_stats
 
     def get_model_config(self):
         return self.model_config

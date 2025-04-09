@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
 from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Deque, Dict,
-                    Iterable, List, Literal, Mapping, NamedTuple, Optional)
+                    Iterable, List, Literal, Mapping, NamedTuple, Optional, Tuple)
 from typing import Sequence as GenericSequence
 from typing import Set, Type, Union, cast, overload
 
@@ -1289,7 +1289,11 @@ class LLMEngine:
                 else:
                     seq.append_token_id(sample.output_token, sample.logprobs)
 
-    def step(self) -> List[Union[RequestOutput, PoolingRequestOutput]]:
+    def step(self) -> Tuple[List[Union[RequestOutput, PoolingRequestOutput]], 
+                            # for compatibility with V1 
+                            # step API which return Scheduler stat
+                            None  
+                            ]:
         """Performs one decoding iteration and returns newly generated results.
 
         .. figure:: https://i.imgur.com/sv2HssD.png
@@ -1516,7 +1520,7 @@ class LLMEngine:
             logger.debug("Stopping remote worker execution loop.")
             self.model_executor.stop_remote_worker_execution_loop()
 
-        return ctx.request_outputs
+        return ctx.request_outputs, None
 
     def _abort_and_cache_schedule(
             self, request_id: str, virtual_engine: int,

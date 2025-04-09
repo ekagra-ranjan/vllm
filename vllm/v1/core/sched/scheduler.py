@@ -112,6 +112,8 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager = EncoderCacheManager(
             cache_size=encoder_cache_size)
 
+        self.spec_decoding_stats = SpecDecodingStats()
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -569,6 +571,7 @@ class Scheduler(SchedulerInterface):
         new_running: list[Request] = []
         outputs: list[EngineCoreOutput] = []
         spec_decoding_stats: Optional[SpecDecodingStats] = None
+        # spec_decoding_stats = self.spec_decoding_stats
 
         # NOTE(woosuk): As len(self.running) can be up to 1K or more, the below
         # loop can be a performance bottleneck. We should do our best to avoid
