@@ -147,6 +147,7 @@ class Scheduler(SchedulerInterface):
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
         )
+        self.spec_decoding_stats = SpecDecodingStats.new(self.num_spec_tokens)
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -687,7 +688,8 @@ class Scheduler(SchedulerInterface):
 
         new_running: list[Request] = []
         outputs: list[EngineCoreOutput] = []
-        spec_decoding_stats: Optional[SpecDecodingStats] = None
+        # spec_decoding_stats: Optional[SpecDecodingStats] = None
+        spec_decoding_stats = self.spec_decoding_stats
 
         # NOTE(woosuk): As len(self.running) can be up to 1K or more, the below
         # loop can be a performance bottleneck. We should do our best to avoid

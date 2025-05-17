@@ -102,7 +102,7 @@ def main():
 
     sampling_params = SamplingParams(temperature=args.temp, max_tokens=256)
 
-    outputs = llm.generate(prompt_token_ids=prompt_ids,
+    outputs, scheduler_stats = llm.generate(prompt_token_ids=prompt_ids,
                            sampling_params=sampling_params)
 
     # print the generated text
@@ -112,22 +112,36 @@ def main():
         print(f"generated text: {output.outputs[0].text}")
         print("-" * 50)
 
-    if not hasattr(outputs, "metrics") or outputs.metrics is None:
-        return
+    # if not hasattr(outputs, "metrics") or outputs.metrics is None:
+    #     return
 
     # calculate the average number of accepted tokens per forward pass, +1 is
     # to account for the token from the target model that's always going to be
     # accepted
-    acceptance_counts = [0] * (args.num_spec_tokens + 1)
-    for output in outputs:
-        for step, count in enumerate(
-                output.metrics.spec_token_acceptance_counts):
-            acceptance_counts[step] += count
+    # import pdb; pdb.set_trace() # REMOVE
+    if scheduler_stats is None:
+        acceptance_counts = [0] * (args.num_spec_tokens + 1)
+        for output in outputs:
+            for step, count in enumerate(
+                    output.metrics.spec_token_acceptance_counts):
+                acceptance_counts[step] += count
 
-    print("-" * 50)
-    print(f"mean acceptance length (including bonus tokens): \
-        {1 + (sum(acceptance_counts) / acceptance_counts[0]):.2f}")
-    print("-" * 50)
+        print("-" * 50)
+        print(f"mean acceptance length: \
+            {sum(acceptance_counts) / acceptance_counts[0]:.2f}")
+        print("-" * 50)
+    elif scheduler_stats.spec_decoding_stats is not None:
+        num_draft_tokens = scheduler_stats.spec_decoding_stats.num_draft_tokens
+        num_accepted_tokens = scheduler_stats.spec_decoding_stats.num_accepted_tokens
+        num_spec_proposal = num_draft_tokens / args.num_spec_tokens
+        mean_accepted_tokens = 1 + num_accepted_tokens / num_spec_proposal
+        print("-" * 50)
+        print(f"mean acceptance length: {mean_accepted_tokens:.2f}, \
+              num_draft_tokens: {num_draft_tokens}, \
+              num_accepted_tokens: {num_accepted_tokens} \
+              num_spec_proposal: {num_spec_proposal}")
+        print("-" * 50)
+
 
     # print acceptance at each token position
     for i in range(len(acceptance_counts)):
