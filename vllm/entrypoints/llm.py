@@ -4,7 +4,7 @@ import itertools
 import warnings
 from collections.abc import Sequence
 from contextlib import contextmanager
-from typing import Any, Callable, ClassVar, Optional, Union, cast, overload
+from typing import Any, Callable, ClassVar, Optional, Union, cast, overload, Tuple
 
 import cloudpickle
 import torch.nn as nn
@@ -46,6 +46,7 @@ from vllm.transformers_utils.tokenizer import (AnyTokenizer, MistralTokenizer,
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import (Counter, Device, deprecate_args, deprecate_kwargs,
                         is_list_of)
+from vllm.v1.metrics.stats import SchedulerStats
 
 logger = init_logger(__name__)
 
@@ -395,7 +396,7 @@ class LLM:
         guided_options_request: Optional[Union[LLMGuidedOptions,
                                                GuidedDecodingRequest]] = None,
         priority: Optional[list[int]] = None,
-    ) -> list[RequestOutput]:
+    ) -> Tuple[list[RequestOutput], SchedulerStats]:
         """Generates the completions for the input prompts.
 
         This class automatically batches the given prompts, considering
@@ -476,8 +477,8 @@ class LLM:
             priority=priority,
         )
 
-        outputs = self._run_engine(use_tqdm=use_tqdm)
-        return self.engine_class.validate_outputs(outputs, RequestOutput)
+        outputs, scheduler_stats = self._run_engine(use_tqdm=use_tqdm)
+        return self.engine_class.validate_outputs(outputs, RequestOutput), scheduler_stats
 
     def collective_rpc(self,
                        method: Union[str, Callable[..., _R]],
@@ -976,7 +977,7 @@ class LLM:
             prompt_adapter_request=prompt_adapter_request,
         )
 
-        outputs = self._run_engine(use_tqdm=use_tqdm)
+        outputs, _ = self._run_engine(use_tqdm=use_tqdm)
         return self.engine_class.validate_outputs(outputs,
                                                   PoolingRequestOutput)
 
@@ -1146,7 +1147,7 @@ class LLM:
             prompt_adapter_request=prompt_adapter_request,
         )
 
-        outputs = self._run_engine(use_tqdm=use_tqdm)
+        outputs, _ = self._run_engine(use_tqdm=use_tqdm)
         items = self.engine_class.validate_outputs(outputs,
                                                    PoolingRequestOutput)
 
@@ -1444,7 +1445,7 @@ class LLM:
 
     def _run_engine(
             self, *, use_tqdm: bool
-    ) -> list[Union[RequestOutput, PoolingRequestOutput]]:
+    ) -> Tuple[list[Union[RequestOutput, PoolingRequestOutput]], Optional[SchedulerStats]]:
         # Initialize tqdm.
         if use_tqdm:
             num_requests = self.llm_engine.get_num_unfinished_requests()
@@ -1461,7 +1462,7 @@ class LLM:
         total_in_toks = 0
         total_out_toks = 0
         while self.llm_engine.has_unfinished_requests():
-            step_outputs = self.llm_engine.step()
+            step_outputs, scheduler_stats = self.llm_engine.step()
             for output in step_outputs:
                 if output.finished:
                     outputs.append(output)
@@ -1488,4 +1489,4 @@ class LLM:
         # Sort the outputs by request ID.
         # This is necessary because some requests may be finished earlier than
         # its previous requests.
-        return sorted(outputs, key=lambda x: int(x.request_id))
+        return sorted(outputs, key=lambda x: int(x.request_id)), scheduler_stats
