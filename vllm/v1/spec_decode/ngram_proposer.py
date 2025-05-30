@@ -11,13 +11,23 @@ class NgramProposer:
 
     def __init__(self, vllm_config: VllmConfig):
         # Minimum length of the n-gram to match.
-        self.min_n = vllm_config.speculative_config.prompt_lookup_min
+        # REVERT
+        # self.min_n = vllm_config.speculative_config.prompt_lookup_min
+        self.min_n = 2  # Default value for minimum n-gram length
+
         # Maximum length of the n-gram to match.
-        self.max_n = vllm_config.speculative_config.prompt_lookup_max
+        # REVERT
+        # self.max_n = vllm_config.speculative_config.prompt_lookup_max
+        self.max_n = 5  # Default value for maximum n-gram length
+        
         # Number of tokens follow the match. If there are less than k
         # tokens follow the match, we will return the maximum amount of
         # tokens until the end.
-        self.k = vllm_config.speculative_config.num_speculative_tokens
+        
+        # REVERT
+        # self.k = vllm_config.speculative_config.num_speculative_tokens
+        self.k = 5  # Default value for number of tokens to return
+        
         # Maximum length of the model.
         self.max_model_len = vllm_config.model_config.max_model_len
 
@@ -63,6 +73,10 @@ class NgramProposer:
             result = _find_subarray_kmp(context_token_ids, n, k)
             if result is not None:
                 return result
+        
+        # REMOVE
+        print(f"pattern = context_token_ids[-n:] {context_token_ids[-n:]}, n = {n}, k = {k}")
+
         return None
 
     def load_model(self, *args, **kwargs):
