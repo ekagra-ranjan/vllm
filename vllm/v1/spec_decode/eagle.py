@@ -41,8 +41,13 @@ class EagleProposer:
         self.dtype = vllm_config.model_config.dtype
         self.max_model_len = vllm_config.model_config.max_model_len
         self.block_size = vllm_config.cache_config.block_size
-        self.num_speculative_tokens = (
-            self.speculative_config.num_speculative_tokens)
+        
+        # REVERT
+        # self.num_speculative_tokens = (
+        #     self.speculative_config.num_speculative_tokens)
+        self.num_speculative_tokens = 3
+        
+        
         self.max_num_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens)
         # We need to get the hidden size from the draft model config because
@@ -113,7 +118,7 @@ class EagleProposer:
         # FA requires seq_len to have dtype int32.
         seq_lens = (target_positions[last_token_indices] + 1).int()
 
-        if self.method in ["eagle", "eagle3"]:
+        if self.method in ["eagle", "eagle3", "ngram-eagle"]:
             # FIXME(woosuk): The below two ops cause synchronization. Optimize.
             max_seq_len = seq_lens.max().item()
             max_num_tokens = (cu_num_tokens[1:] -

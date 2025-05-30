@@ -56,6 +56,11 @@ def main():
         tokenizer.encode(prompt.prompt, add_special_tokens=False) for prompt in prompts
     ]
 
+    # REMOVE
+    for i in range(len(prompts)):
+        print(prompts[i].prompt)
+        print(prompt_ids[i])  
+
     if args.method == "eagle" or args.method == "eagle3":
         if args.method == "eagle":
             eagle_dir = "yuhuili/EAGLE-LLaMA3.1-Instruct-8B"
@@ -102,6 +107,7 @@ def main():
             print("-" * 50)
             print(f"prompt: {output.prompt}")
             print(f"generated text: {output.outputs[0].text}")
+            print(f"len of generated tokens: {len(output.outputs[0].token_ids)}")
             print("-" * 50)
 
     try:
@@ -126,6 +132,8 @@ def main():
 
     print("-" * 50)
     print(f"mean acceptance length: {1 + (num_accepted / num_drafts):.2f}")
+    # REMOVE
+    print(f"num drafts: {num_drafts}, num accepted: {num_accepted}")
     print("-" * 50)
 
     # print acceptance at each token position

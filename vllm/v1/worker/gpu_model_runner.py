@@ -160,26 +160,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # req_id -> (input_id -> encoder_output)
         self.encoder_cache: dict[str, dict[int, torch.Tensor]] = {}
 
+        # REMOVE
+        # self.speculative_config.method = "ngram-eagle"
+
         self.use_aux_hidden_state_outputs = False
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
         # layers in the draft model.
         if self.speculative_config and get_pp_group().is_last_rank:
-            if self.speculative_config.method == "ngram":
-                self.drafter = NgramProposer(self.vllm_config)
-            elif self.speculative_config.use_eagle():
-                self.drafter = EagleProposer(self.vllm_config, self.device,
+            if self.speculative_config.method == "ngram" or self.speculative_config.method == "ngram-eagle":
+                self.drafter_ngram = NgramProposer(self.vllm_config)
+                print("NgramProposer is initialized.")
+            # REVERT
+            if self.speculative_config.use_eagle():
+                self.drafter_eagle = EagleProposer(self.vllm_config, self.device,
                                              self)  # type: ignore
                 if self.speculative_config.method == "eagle3":
                     self.use_aux_hidden_state_outputs = True
+                print("EagleProposer is initialized.")
             elif self.speculative_config.method == "medusa":
                 self.drafter = MedusaProposer(
                     vllm_config=self.vllm_config,
                     device=self.device)  # type: ignore
-            else:
-                raise ValueError("Unknown speculative decoding method: "
-                                 f"{self.speculative_config.method}")
+            # else:
+            #     raise ValueError("Unknown speculative decoding method: "
+            #                      f"{self.speculative_config.method}")
             self.rejection_sampler = RejectionSampler()
 
         # Request states.
@@ -1484,10 +1490,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not self.speculative_config:
             # Speculative decoding is not enabled.
             spec_token_ids = None
-        elif self.speculative_config.method == "ngram":
-            assert isinstance(self.drafter, NgramProposer)
+        elif self.speculative_config.method == "ngram" or self.speculative_config.method == "ngram-eagle":
+            assert isinstance(self.drafter_ngram, NgramProposer)
             spec_token_ids = self.generate_draft_token_ids(
                 valid_sampled_token_ids, sampling_metadata)
+            if self.speculative_config.method == "ngram-eagle":
+                spec_token_ids_ngram = spec_token_ids
+            else:
+                for bid in range(len(spec_token_ids)):
+                    # if len(spec_token_ids[bid]):
+                    print("ngram spec len: ",
+                        len(spec_token_ids[bid]))
+                    
+                        
         elif self.speculative_config.method == "medusa":
             assert isinstance(self.drafter, MedusaProposer)
             if max_gen_len == 1:
@@ -1509,8 +1524,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 target_hidden_states=hidden_states,
                 sampling_metadata=sampling_metadata,
             )
-        elif self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, EagleProposer)
+        
+        if self.speculative_config.use_eagle():
+            assert isinstance(self.drafter_eagle, EagleProposer)
             # TODO(woosuk): Refactor the loop.
             next_token_ids: list[int] = []
             for i, token_ids in enumerate(valid_sampled_token_ids):
@@ -1532,7 +1548,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # At this moment, we assume all eagle layers belong to the same KV
             # cache group, thus using the same attention metadata.
             eagle_attn_metadata = attn_metadata[
-                self.drafter.attn_layer_names[0]]
+                self.drafter_eagle.attn_layer_names[0]]
 
             # NOTE: deepseek_mtp uses MLA which does not have `block_table`
             if hasattr(eagle_attn_metadata, "block_table"):
@@ -1565,7 +1581,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     target_device=self.device,
                     pin_memory=True)
                 num_tokens = num_scheduled_tokens - sum(num_rejected_tokens)
-                cu_num_tokens, token_indices = self.drafter.prepare_inputs(
+                cu_num_tokens, token_indices = self.drafter_eagle.prepare_inputs(
                     eagle_attn_metadata.query_start_loc,
                     num_rejected_tokens_tensor,
                     num_tokens,
@@ -1579,7 +1595,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     target_hidden_states = hidden_states[token_indices]
                 target_slot_mapping = eagle_attn_metadata.slot_mapping[
                     token_indices]
-            draft_token_ids = self.drafter.propose(
+            draft_token_ids = self.drafter_eagle.propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
                 target_hidden_states=target_hidden_states,
@@ -1590,6 +1606,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 sampling_metadata=sampling_metadata,
             )
             spec_token_ids = draft_token_ids.tolist()
+            if self.speculative_config.method == "ngram-eagle":
+                # For ngram-eagle, we also need to generate the ngram tokens.
+                spec_token_ids_eagle = spec_token_ids
+                spec_token_ids = []
+                for bid in range(len(spec_token_ids_ngram)):
+                    if len(spec_token_ids_ngram[bid]):
+                        print(f"ngram spec len: {len(spec_token_ids_ngram[bid])}")
+                        spec_token_ids.append(spec_token_ids_ngram[bid])
+                    else:
+                        print(f"eagle spec len: {len(spec_token_ids_eagle[bid])}")
+                        # If no ngram tokens, use eagle tokens.
+                        # NOTE:
+                        spec_token_ids.append(spec_token_ids_eagle[bid])
+                        # spec_token_ids.append([])
 
         # Clear KVConnector state after all KVs are generated.
         if has_kv_transfer_group():
@@ -1684,7 +1714,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 continue
 
             self.input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids
-            drafter_output = self.drafter.propose(
+            drafter_output = self.drafter_ngram.propose(
                 self.input_batch.token_ids_cpu[i, :end_idx])
             if drafter_output is None or len(drafter_output) == 0:
                 draft_token_ids.append([])
@@ -1717,6 +1747,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self, "drafter"):
                 logger.info("Loading drafter model...")
                 self.drafter.load_model(self.model)
+            
+            # REVERT
+            if hasattr(self, "drafter_eagle"):
+                logger.info("Loading eagle drafter model...")
+                self.drafter_eagle.load_model(self.model)
+            
             if self.use_aux_hidden_state_outputs:
                 self.model.set_aux_hidden_state_layers(
                     self.model.get_eagle3_aux_hidden_state_layers())
@@ -1978,8 +2014,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 hidden_states = outputs
 
             if self.speculative_config and self.speculative_config.use_eagle():
-                assert isinstance(self.drafter, EagleProposer)
-                self.drafter.dummy_run(num_tokens)
+                assert isinstance(self.drafter_eagle, EagleProposer)
+                self.drafter_eagle.dummy_run(num_tokens)
 
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
         return hidden_states, hidden_states[logit_indices]
@@ -2447,10 +2483,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
 
         if self.speculative_config and self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, EagleProposer)
+            assert isinstance(self.drafter_eagle, EagleProposer)
             # validate all draft model layers belong to the same kv cache
             # group
-            self.drafter.validate_same_kv_cache_group(kv_cache_config)
+            self.drafter_eagle.validate_same_kv_cache_group(kv_cache_config)
 
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)

@@ -2825,7 +2825,7 @@ class SpeculativeConfig:
         return self.num_speculative_tokens
 
     def use_eagle(self) -> bool:
-        return self.method in ("eagle", "eagle3", "deepseek_mtp")
+        return self.method in ("eagle", "eagle3", "deepseek_mtp", "ngram-eagle")
 
     def __repr__(self) -> str:
         method = self.method
