@@ -56,9 +56,11 @@ def main():
     ]
 
     # REMOVE
+    import pdb; pdb.set_trace()
     for i in range(len(prompts)):
         print(prompts[i].prompt)
         print(prompt_ids[i])  
+        print(f"len of prompt {i}: {len(prompt_ids[i])}")
 
     if args.method == "eagle" or args.method == "eagle3":
         if args.method == "eagle":
@@ -97,6 +99,7 @@ def main():
         disable_log_stats=False,
     )
 
+    # REVERT
     sampling_params = SamplingParams(temperature=args.temp, max_tokens=256)
     outputs = llm.generate(prompt_token_ids=prompt_ids, sampling_params=sampling_params)
 
@@ -107,6 +110,7 @@ def main():
             print(f"prompt: {output.prompt}")
             print(f"generated text: {output.outputs[0].text}")
             print(f"len of generated tokens: {len(output.outputs[0].token_ids)}")
+            print(f"output.outputs[0].token_ids: {output.outputs[0].token_ids}")
             print("-" * 50)
 
     try:
@@ -128,11 +132,26 @@ def main():
             assert isinstance(metric, Vector)
             for pos in range(len(metric.values)):
                 acceptance_counts[pos] += metric.values[pos]
+        elif metric.name == "vllm:generation_tokens":
+            assert isinstance(metric, Counter)
+            print(f"num generation tokens: {metric.value}")
+            total_tokens_generated = metric.value
+        elif metric.name == "vllm:spec_decode_num_no_drafts":
+            assert isinstance(metric, Counter)
+            print(f"num no drafts: {metric.value}")
+            num_no_drafts = metric.value
 
     print("-" * 50)
     print(f"mean acceptance length: {1 + (num_accepted / num_drafts):.2f}")
     # REMOVE
     print(f"num drafts: {num_drafts}, num accepted: {num_accepted}")
+    num_tokens_generated_without_sd = total_tokens_generated - (num_drafts + num_accepted)
+    seq_normalized_acceptance_length = (total_tokens_generated) / (num_drafts + num_tokens_generated_without_sd)
+    print(f"num_tokens_generated_without_sd: {num_tokens_generated_without_sd}")
+    print(f"seq normalized acceptance length: {seq_normalized_acceptance_length:.2f}")
+    
+    correct_al = (num_drafts + num_accepted + num_no_drafts) / (num_drafts + num_no_drafts)
+    print(f"correct AL: {correct_al:.2f}")
     print("-" * 50)
 
     # print acceptance at each token position

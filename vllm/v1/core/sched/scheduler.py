@@ -277,6 +277,8 @@ class Scheduler(SchedulerInterface):
             req_index += 1
 
             # Speculative decode related.
+            # REMOVE
+            print(f"request.spec_token_ids: {request.spec_token_ids}")
             if request.spec_token_ids:
                 num_scheduled_spec_tokens = (num_new_tokens +
                                              request.num_computed_tokens -
@@ -720,20 +722,41 @@ class Scheduler(SchedulerInterface):
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id))
-            if scheduled_spec_token_ids:
-                # num_computed_tokens represents the number of tokens
-                # processed in the current step, considering scheduled
-                # tokens and rejections. If some tokens are rejected,
-                # num_computed_tokens is decreased by the number of rejected
-                # tokens, where is given by:
-                # len(scheduled_spec_token_ids) + 1 - len(generated_token_ids).
-                num_tokens_rejected = (len(scheduled_spec_token_ids) + 1 -
-                                       len(generated_token_ids))
-                request.num_computed_tokens -= num_tokens_rejected
+            if generated_token_ids:
+                # REMOVE
+                print(f"Request {req_id} generated tokens: {generated_token_ids}, scheduled_spec_token_ids: {scheduled_spec_token_ids}, spec_token_ids: {spec_token_ids}")
+                
+                if scheduled_spec_token_ids:
+                    # num_computed_tokens represents the number of tokens
+                    # processed in the current step, considering scheduled
+                    # tokens and rejections. If some tokens are rejected,
+                    # num_computed_tokens is decreased by the number of rejected
+                    # tokens, where is given by:
+                    # len(scheduled_spec_token_ids) + 1 - len(generated_token_ids).
+                    num_tokens_rejected = (len(scheduled_spec_token_ids) + 1 -
+                                        len(generated_token_ids))
+                    request.num_computed_tokens -= num_tokens_rejected
+                    num_draft_tokens = len(scheduled_spec_token_ids)
+                    num_accepted_tokens = len(generated_token_ids) - 1
+                else:
+                    # sched data
+                    # req_data = scheduler_output.scheduled_cached_reqs[req_id]
+                    # print(f"Request {req_id} req_data num_computed_tokens: {req_data.num_computed_tokens}, num_tokens: {req_data.num_tokens}")
+                    # request
+                    print(f"request num_computed_tokens: {request.num_computed_tokens}, num_tokens: {request.num_tokens}")
+                    # scheduler
+                    print(f"scheduler_output.num_scheduled_tokens[req_id]: {scheduler_output.num_scheduled_tokens[req_id]}")
+
+
+
+                    # No speculative decoding for this request.
+                    num_draft_tokens = 0
+                    num_accepted_tokens = 0
+
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
-                    num_draft_tokens=len(scheduled_spec_token_ids),
-                    num_accepted_tokens=len(generated_token_ids) - 1)
+                    num_draft_tokens=num_draft_tokens,
+                    num_accepted_tokens=num_accepted_tokens)
 
             cached_encoder_input_ids = (
                 self.encoder_cache_manager.get_cached_input_ids(request))

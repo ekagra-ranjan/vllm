@@ -22,7 +22,10 @@ class SpecDecodingStats:
     """
 
     num_spec_tokens: int
+    # num of times drafts were made
     num_drafts: int = 0
+    # num of times no drafts were available
+    num_no_drafts: int = 0
     num_draft_tokens: int = 0
     num_accepted_tokens: int = 0
     num_accepted_tokens_per_pos: list[int] = field(default_factory=list)
@@ -33,7 +36,11 @@ class SpecDecodingStats:
                    num_accepted_tokens_per_pos=[0] * num_spec_tokens)
 
     def observe_draft(self, num_draft_tokens: int, num_accepted_tokens: int):
-        self.num_drafts += 1
+        if num_draft_tokens > 0:
+            self.num_drafts += 1
+        else:
+            self.num_no_drafts += 1
+
         self.num_draft_tokens += num_draft_tokens
         self.num_accepted_tokens += num_accepted_tokens
         assert num_accepted_tokens <= self.num_spec_tokens
@@ -54,12 +61,14 @@ class SpecDecodingLogging:
 
     def reset(self):
         self.num_drafts: list[int] = []
+        self.num_no_drafts: list[int] = []
         self.num_draft_tokens: list[int] = []
         self.num_accepted_tokens: list[int] = []
         self.accepted_tokens_per_pos_lists: list[list[int]] = []
 
     def observe(self, spec_decoding_stats: SpecDecodingStats):
         self.num_drafts.append(spec_decoding_stats.num_drafts)
+        self.num_no_drafts.append(spec_decoding_stats.num_no_drafts)
         self.num_draft_tokens.append(spec_decoding_stats.num_draft_tokens)
         self.num_accepted_tokens.append(
             spec_decoding_stats.num_accepted_tokens)
@@ -135,7 +144,12 @@ class SpecDecodingProm:
         self.counter_spec_decode_num_drafts = \
             self._counter_cls(
                 name="vllm:spec_decode_num_drafts",
-                documentation="Number of spec decoding drafts.",
+                documentation="Number of time spec decoding drafts were made.",
+                labelnames=labelnames).labels(*labelvalues)
+        self.counter_spec_decode_num_no_drafts = \
+            self._counter_cls(
+                name="vllm:spec_decode_num_no_drafts",
+                documentation="Number of times no spec decoding drafts were made.",
                 labelnames=labelnames).labels(*labelvalues)
         self.counter_spec_decode_num_draft_tokens = \
             self._counter_cls(
@@ -168,6 +182,7 @@ class SpecDecodingProm:
         if not self.spec_decoding_enabled:
             return
         self.counter_spec_decode_num_drafts.inc(spec_decoding_stats.num_drafts)
+        self.counter_spec_decode_num_no_drafts.inc(spec_decoding_stats.num_no_drafts)
         self.counter_spec_decode_num_draft_tokens.inc(
             spec_decoding_stats.num_draft_tokens)
         self.counter_spec_decode_num_accepted_tokens.inc(

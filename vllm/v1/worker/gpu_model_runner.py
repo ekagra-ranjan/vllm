@@ -1289,6 +1289,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_state = self.requests[req_id]
             seq_len = (req_state.num_computed_tokens +
                        scheduler_output.num_scheduled_tokens[req_id])
+            # REMOVE
+            print(f"req_id: {req_id}, seq_len: {seq_len}, req_state.num_computed_tokens: {req_state.num_computed_tokens}, scheduler_output.num_scheduled_tokens[req_id]: {scheduler_output.num_scheduled_tokens[req_id]}, req_state.num_tokens: {req_state.num_tokens}")
             if seq_len < req_state.num_tokens:
                 # Ignore the sampled token for partial prefills.
                 # Rewind the generator state as if the token was not sampled.
@@ -1299,6 +1301,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # Record the index of the request that should not be sampled,
                 # so that we could clear the sampled tokens before returning.
                 discard_sampled_tokens_req_indices.append(i)
+        
+        # REMOVE
+        print(f"discard_sampled_tokens_req_indices: {discard_sampled_tokens_req_indices}")
 
         # NOTE: GPU -> CPU Sync happens here.
         # Move as many CPU operations as possible before this sync point.
@@ -1397,6 +1402,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else:
                 block_table = None
 
+            # REMOVE
+            print(f"spec_decode_metadata: {spec_decode_metadata}")
+
             if spec_decode_metadata is None:
                 # input_ids can be None for multimodal models.
                 target_token_ids = self.input_ids[:num_scheduled_tokens]
@@ -1436,6 +1444,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     target_hidden_states = hidden_states[token_indices]
                 target_slot_mapping = eagle_attn_metadata.slot_mapping[
                     token_indices]
+            
+            # REMOVE
+            print(f"before eagle propose")
+
             draft_token_ids = self.drafter_eagle.propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
@@ -1461,10 +1473,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         # NOTE:
                         spec_token_ids.append(spec_token_ids_eagle[bid])
                         # spec_token_ids.append([])
+            
+            # REMOVE
+            print(f"spec_token_ids: {spec_token_ids}")
 
         # Clear KVConnector state after all KVs are generated.
         if has_kv_transfer_group():
             get_kv_transfer_group().clear_connector_metadata()
+
+        # REMOVE
+        print(f"valid_sampled_token_ids: {valid_sampled_token_ids}, spec_token_ids: {spec_token_ids}")
 
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
