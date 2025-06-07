@@ -128,11 +128,19 @@ def main():
             assert isinstance(metric, Vector)
             for pos in range(len(metric.values)):
                 acceptance_counts[pos] += metric.values[pos]
+        elif metric.name == "vllm:generation_tokens":
+            assert isinstance(metric, Counter)
+            print(f"num generation tokens: {metric.value}")
+            total_tokens_generated = metric.value
 
     print("-" * 50)
     print(f"mean acceptance length: {1 + (num_accepted / num_drafts):.2f}")
     # REMOVE
     print(f"num drafts: {num_drafts}, num accepted: {num_accepted}")
+    num_tokens_generated_without_sd = total_tokens_generated - (num_drafts + num_accepted)
+    seq_normalized_acceptance_length = (total_tokens_generated) / (num_drafts + num_tokens_generated_without_sd)
+    print(f"num_tokens_generated_without_sd: {num_tokens_generated_without_sd}")
+    print(f"seq normalized acceptance length: {seq_normalized_acceptance_length:.2f}")
     print("-" * 50)
 
     # print acceptance at each token position
