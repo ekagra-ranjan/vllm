@@ -138,7 +138,7 @@ def main():
     print(f"mean acceptance length: {1 + (num_accepted / num_drafts):.2f}")
     # REMOVE
     print(f"num drafts: {num_drafts}, num accepted: {num_accepted}")
-    num_tokens_generated_without_sd = total_tokens_generated - (num_drafts + num_accepted)Add commentMore actions
+    num_tokens_generated_without_sd = total_tokens_generated - (num_drafts + num_accepted)
     seq_normalized_acceptance_length = (total_tokens_generated) / (num_drafts + num_tokens_generated_without_sd)
     print(f"num_tokens_generated_without_sd: {num_tokens_generated_without_sd}")
     print(f"seq normalized acceptance length: {seq_normalized_acceptance_length:.2f}")
