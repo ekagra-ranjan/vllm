@@ -123,6 +123,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.is_multimodal_model = model_config.is_multimodal_model
         self.is_pooling_model = model_config.pooler_config is not None
         self.max_model_len = model_config.max_model_len
+        # REMOVE
+        print(f"GPUModelRunner: max_model_len={self.max_model_len}")
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         self.max_num_reqs = scheduler_config.max_num_seqs
 

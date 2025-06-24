@@ -1441,6 +1441,8 @@ class ModelConfig:
             sliding_window_len=self.get_hf_config_sliding_window(),
             spec_target_max_model_len=self.spec_target_max_model_len,
             encoder_config=self.encoder_config)
+        # REMOVE
+        max_model_len = 150000
         logger.info("Using max model len %s", max_model_len)
         return max_model_len
 

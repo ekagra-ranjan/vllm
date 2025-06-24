@@ -40,6 +40,10 @@ class EagleProposer:
 
         self.dtype = vllm_config.model_config.dtype
         self.max_model_len = vllm_config.model_config.max_model_len
+        
+        # REMOVE
+        print(f"propose max_model_len: {self.max_model_len}, self.block_size: {vllm_config.cache_config.block_size}")
+
         self.block_size = vllm_config.cache_config.block_size
         self.num_speculative_tokens = (
             self.speculative_config.num_speculative_tokens)
@@ -238,6 +242,7 @@ class EagleProposer:
 
             # Compute the slot mapping.
             block_numbers = clamped_positions // self.block_size
+
             block_ids = block_table.gather(dim=1,
                                            index=block_numbers.view(-1, 1))
             block_ids = block_ids.view(-1)

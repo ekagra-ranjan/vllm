@@ -320,6 +320,9 @@ class RandomDataset(BenchmarkDataset):
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
+        # EKAGRA: add upstream
+        random.seed(self.random_seed)
+        np.random.seed(self.random_seed)
 
     def sample(
         self,
