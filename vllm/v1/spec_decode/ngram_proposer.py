@@ -16,13 +16,25 @@ class NgramProposer:
         assert vllm_config.speculative_config.prompt_lookup_max is not None
 
         # Minimum length of the n-gram to match.
-        self.min_n = vllm_config.speculative_config.prompt_lookup_min
+        
+        # REVERT
+        # self.min_n = vllm_config.speculative_config.prompt_lookup_min
+        self.min_n = 2  # Default value for minimum n-gram length
+
         # Maximum length of the n-gram to match.
-        self.max_n = vllm_config.speculative_config.prompt_lookup_max
+        
+        # REVERT
+        # self.max_n = vllm_config.speculative_config.prompt_lookup_max
+        self.max_n = 5  # Default value for maximum n-gram length
+
         # Number of tokens follow the match. If there are less than k
         # tokens follow the match, we will return the maximum amount of
         # tokens until the end.
-        self.k = vllm_config.speculative_config.num_speculative_tokens
+        
+        # REVERT
+        # self.k = vllm_config.speculative_config.num_speculative_tokens
+        self.k = 5  # Default value for number of tokens to return
+
         # Maximum length of the model.
         self.max_model_len = vllm_config.model_config.max_model_len
 
@@ -58,6 +70,10 @@ class NgramProposer:
               followed that pattern. Here we will return [4,2,3] because 
               we only have three tokens after the match.
         """
+        
+        # REMOVE
+        print(f"pattern = context_token_ids[-n:] {context_token_ids[-self.max_n:]}, self.max_n = {self.max_n}, k = {self.k}")
+
         # TODO(woosuk): Optimize this.
         return _find_longest_matched_ngram_and_propose_tokens(
             origin_tokens=context_token_ids,

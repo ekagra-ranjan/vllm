@@ -61,8 +61,12 @@ class EagleProposer:
         self.dtype = vllm_config.model_config.dtype
         self.max_model_len = vllm_config.model_config.max_model_len
         self.block_size = vllm_config.cache_config.block_size
-        self.num_speculative_tokens = (
-            self.speculative_config.num_speculative_tokens)
+        
+        # REVERT
+        # self.num_speculative_tokens = (
+        #     self.speculative_config.num_speculative_tokens)
+        self.num_speculative_tokens = 3
+
         self.max_num_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens)
         self.token_arange_np = np.arange(self.max_num_tokens)

@@ -96,6 +96,12 @@ def main():
             tokenizer.encode(prompt.prompt, add_special_tokens=False)
             for prompt in prompts
         ]
+
+        # REMOVE
+        for i in range(len(prompts)):
+            print(prompts[i].prompt)
+            print(prompt_ids[i]) 
+            
     else:
         prompts = get_custom_mm_prompts(args.num_prompts)
 
@@ -150,6 +156,8 @@ def main():
             print("-" * 50)
             print(f"prompt: {output.prompt}")
             print(f"generated text: {output.outputs[0].text}")
+            # REMOVE
+            print(f"len of generated tokens: {len(output.outputs[0].token_ids)}")
             print("-" * 50)
 
     try:
@@ -179,6 +187,11 @@ def main():
             assert isinstance(metric, Vector)
             for pos in range(len(metric.values)):
                 acceptance_counts[pos] += metric.values[pos]
+        # REMOVE
+        elif metric.name == "vllm:generation_tokens":
+            assert isinstance(metric, Counter)
+            print(f"num generation tokens: {metric.value}")
+            total_tokens_generated = metric.value
 
     print("-" * 50)
     print(f"total_num_output_tokens: {total_num_output_tokens}")
@@ -187,6 +200,16 @@ def main():
     print(f"num_accepted_tokens: {num_accepted_tokens}")
     acceptance_length = 1 + (num_accepted_tokens / num_drafts) if num_drafts > 0 else 1
     print(f"mean acceptance length: {acceptance_length:.2f}")
+    
+    # REMOVE
+    print("COHERE START")
+    print(f"num drafts: {num_drafts}, num accepted: {num_accepted_tokens}")
+    num_tokens_generated_without_sd = total_tokens_generated - (num_drafts + num_accepted_tokens)
+    seq_normalized_acceptance_length = (total_tokens_generated) / (num_drafts + num_tokens_generated_without_sd)
+    print(f"num_tokens_generated_without_sd: {num_tokens_generated_without_sd}")
+    print(f"seq normalized acceptance length: {seq_normalized_acceptance_length:.2f}")
+    print("COHERE END")
+
     print("-" * 50)
 
     # print acceptance at each token position
