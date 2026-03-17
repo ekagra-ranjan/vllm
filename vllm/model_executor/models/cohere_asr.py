@@ -48,11 +48,14 @@ from vllm.multimodal.processing import (
     PromptReplacement,
     PromptUpdate,
 )
+from vllm.platforms import current_platform
 from vllm.renderers import TokenizeParams
 from vllm.transformers_utils.processors.cohere_asr import (
-    INF_VAL,
     CohereASRFeatureExtractor,
     CohereASRProcessor,
+)
+from vllm.v1.attention.ops.cohere_asr_relpos_attention import (
+    cohere_asr_triton_relpos_attention_wrapper,
 )
 from vllm.v1.attention.backend import (
     AttentionType,
@@ -989,9 +992,14 @@ class CohereASRMultiHeadAttention(nn.Module):
         self.d_k = n_feat // n_head
         self.s_d_k = math.sqrt(self.d_k)
         self.h = n_head
-        self.linear_q = nn.Linear(n_feat, n_feat, bias=use_bias)
-        self.linear_k = nn.Linear(n_feat, n_feat, bias=use_bias)
-        self.linear_v = nn.Linear(n_feat, n_feat, bias=use_bias)
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=n_feat,
+            head_size=self.d_k,
+            total_num_heads=self.h,
+            total_num_kv_heads=self.h,
+            bias=use_bias,
+            disable_tp=True,
+        )
         self.linear_out = nn.Linear(n_feat, n_feat, bias=use_bias)
 
     def forward_qkv(
@@ -1011,9 +1019,15 @@ class CohereASRMultiHeadAttention(nn.Module):
             v (torch.Tensor): (batch, head, time2, size)
         """
         n_batch = query.size(0)
-        q = self.linear_q(query).view(n_batch, -1, self.h, self.d_k)
-        k = self.linear_k(key).view(n_batch, -1, self.h, self.d_k)
-        v = self.linear_v(value).view(n_batch, -1, self.h, self.d_k)
+        if not (query is key and key is value):
+            raise ValueError(
+                "CohereASR encoder attention only supports self-attention inputs."
+            )
+        qkv, _ = self.qkv_proj(query)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = q.view(n_batch, -1, self.h, self.d_k)
+        k = k.view(n_batch, -1, self.h, self.d_k)
+        v = v.view(n_batch, -1, self.h, self.d_k)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
@@ -1022,35 +1036,78 @@ class CohereASRMultiHeadAttention(nn.Module):
 
     def forward_attention(
         self,
+        query: torch.Tensor,
+        key: torch.Tensor,
         value: torch.Tensor,
-        scores: torch.Tensor,
         mask: torch.Tensor | None,
+        pad_mask: torch.Tensor | None = None,
+        attn_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Compute attention context vector.
+        """Compute SDPA-based attention context vector.
         Args:
-            value (torch.Tensor): (batch, time2, size)
-            scores(torch.Tensor): (batch, time1, time2)
-            mask(torch.Tensor): (batch, time1, time2)
+            query (torch.Tensor): (batch, head, time1, d_k)
+            key (torch.Tensor): (batch, head, time2, d_k)
+            value (torch.Tensor): (batch, head, time2, d_k)
+            mask (torch.Tensor): broadcastable attention mask with True
+                values marking blocked positions
+            pad_mask (torch.Tensor): (batch, time1) padding mask with True
+                values marking padded query/key positions
+            attn_bias (torch.Tensor): additive relative-position bias before
+                scaling, with shape (batch, head, time1, time2)
         returns:
             value (torch.Tensor): transformed `value`
                 (batch, time2, d_model) weighted by the
                 attention scores
         """
-        n_batch = value.size(0)
-        if mask is not None:
-            mask = mask.unsqueeze(1)  # (batch, 1, time1, time2)
-            scores = scores.masked_fill(mask, -INF_VAL)
-            attn = torch.softmax(scores, dim=-1).masked_fill(
-                mask, 0.0
-            )  # (batch, head, time1, time2)
+        scale = 1.0 / self.s_d_k
+        sdpa_mask: torch.Tensor | None = None
+
+        if attn_bias is not None:
+            sdpa_mask = (attn_bias * scale).to(query.dtype)
+            mask_value = torch.finfo(sdpa_mask.dtype).min
+            if mask is not None:
+                sdpa_mask = sdpa_mask.masked_fill(mask.unsqueeze(1), mask_value)
+            if pad_mask is not None:
+                sdpa_mask = sdpa_mask.masked_fill(
+                    pad_mask[:, None, None, :], mask_value
+                )
         else:
-            attn = torch.softmax(scores, dim=-1)  # (batch, head, time1, time2)
+            if mask is not None:
+                sdpa_mask = (~mask).unsqueeze(1)
+            if pad_mask is not None:
+                key_mask = (~pad_mask)[:, None, None, :]
+                sdpa_mask = key_mask if sdpa_mask is None else sdpa_mask & key_mask
 
-        x = torch.matmul(attn, value)  # (batch, head, time1, d_k)
+        x = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=sdpa_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=scale,
+        )
+
+        fully_masked_queries: torch.Tensor | None = None
+        if mask is not None:
+            fully_masked_queries = mask.all(dim=-1)
+            if fully_masked_queries.size(0) == 1 and x.size(0) > 1:
+                fully_masked_queries = fully_masked_queries.expand(x.size(0), -1)
+        if pad_mask is not None:
+            fully_masked_queries = (
+                pad_mask
+                if fully_masked_queries is None
+                else fully_masked_queries | pad_mask
+            )
+        if fully_masked_queries is not None:
+            x = x.masked_fill(fully_masked_queries[:, None, :, None], 0.0)
+
+        return self._project_attention_output(x)
+
+    def _project_attention_output(self, x: torch.Tensor) -> torch.Tensor:
         x = x.transpose(1, 2).reshape(
-            n_batch, -1, self.h * self.d_k
+            x.size(0), -1, self.h * self.d_k
         )  # (batch, time1, d_model)
-
         return self.linear_out(x)  # (batch, time1, d_model)
 
     def forward(
@@ -1060,13 +1117,17 @@ class CohereASRMultiHeadAttention(nn.Module):
         value: torch.Tensor,
         mask: torch.Tensor | None,
         pos_emb: torch.Tensor | None = None,
+        pad_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute 'Scaled Dot Product Attention'.
         Args:
             query (torch.Tensor): (batch, time1, size)
             key (torch.Tensor): (batch, time2, size)
             value(torch.Tensor): (batch, time2, size)
-            mask (torch.Tensor): (batch, time1, time2)
+            mask (torch.Tensor): broadcastable attention mask with True
+                values marking blocked positions
+            pad_mask (torch.Tensor): (batch, time1) padding mask with True
+                values marking padded query/key positions
 
         returns:
             output (torch.Tensor): transformed `value`
@@ -1074,9 +1135,7 @@ class CohereASRMultiHeadAttention(nn.Module):
                 query dot key attention
         """
         q, k, v = self.forward_qkv(query, key, value)
-
-        scores = torch.matmul(q, k.transpose(-2, -1)) / self.s_d_k
-        return self.forward_attention(v, scores, mask)
+        return self.forward_attention(q, k, v, mask, pad_mask=pad_mask)
 
 
 class RelPositionMultiHeadAttention(CohereASRMultiHeadAttention):
@@ -1133,6 +1192,74 @@ class RelPositionMultiHeadAttention(CohereASRMultiHeadAttention):
         x = x[:, :, 1:].view(b, h, qlen, pos_len)  # (b, h, t1, t2)
         return x
 
+    def _can_use_triton_relpos_attention(
+        self,
+        query: torch.Tensor,
+        pos_emb: torch.Tensor,
+        mask: torch.Tensor | None,
+        pad_mask: torch.Tensor | None,
+    ) -> bool:
+        if not current_platform.is_cuda() or not query.is_cuda:
+            return False
+        if query.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            return False
+        if self.d_k < 16 or self.d_k > 128 or pos_emb.size(0) != 1:
+            return False
+        if mask is not None and (
+            mask.dtype != torch.bool or mask.size(0) not in (1, query.size(0))
+        ):
+            return False
+        if pad_mask is not None and pad_mask.dtype != torch.bool:
+            return False
+        return True
+
+    def _forward_triton_relpos_attention(
+        self,
+        q_with_bias_u: torch.Tensor,
+        q_with_bias_v: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        p: torch.Tensor,
+        mask: torch.Tensor | None,
+        pad_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        batch_size, _, seq_len, _ = q_with_bias_u.shape
+        if pad_mask is None:
+            seq_lens = torch.full(
+                (batch_size,),
+                seq_len,
+                dtype=torch.int32,
+                device=q_with_bias_u.device,
+            )
+        else:
+            seq_lens = (~pad_mask).sum(dim=-1, dtype=torch.int32)
+
+        x = cohere_asr_triton_relpos_attention_wrapper(
+            q_with_bias_u,
+            q_with_bias_v,
+            k,
+            v,
+            p.squeeze(0),
+            seq_lens,
+            mask,
+        )
+
+        fully_masked_queries: torch.Tensor | None = None
+        if mask is not None:
+            fully_masked_queries = mask.all(dim=-1)
+            if fully_masked_queries.size(0) == 1 and batch_size > 1:
+                fully_masked_queries = fully_masked_queries.expand(batch_size, -1)
+        if pad_mask is not None:
+            fully_masked_queries = (
+                pad_mask
+                if fully_masked_queries is None
+                else fully_masked_queries | pad_mask
+            )
+        if fully_masked_queries is not None:
+            x = x.masked_fill(fully_masked_queries[:, None, :, None], 0.0)
+
+        return self._project_attention_output(x)
+
     def forward(
         self,
         query: torch.Tensor,
@@ -1140,14 +1267,18 @@ class RelPositionMultiHeadAttention(CohereASRMultiHeadAttention):
         value: torch.Tensor,
         mask: torch.Tensor | None,
         pos_emb: torch.Tensor | None = None,
+        pad_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute 'Scaled Dot Product Attention' with rel. positional encoding.
         Args:
             query (torch.Tensor): (batch, time1, size)
             key (torch.Tensor): (batch, time2, size)
             value(torch.Tensor): (batch, time2, size)
-            mask (torch.Tensor): (batch, time1, time2)
-            pos_emb (torch.Tensor) : (batch, time1, size)
+            mask (torch.Tensor): broadcastable attention mask with True
+                values marking blocked positions
+            pos_emb (torch.Tensor): (batch, time1, size)
+            pad_mask (torch.Tensor): (batch, time1) padding mask with True
+                values marking padded query/key positions
 
         Returns:
             output (torch.Tensor): transformed `value`
@@ -1155,32 +1286,40 @@ class RelPositionMultiHeadAttention(CohereASRMultiHeadAttention):
                 query dot key attention
         """
         q, k, v = self.forward_qkv(query, key, value)
-        q = q.transpose(1, 2)  # (batch, time1, head, d_k)
-
+        assert pos_emb is not None
         n_batch_pos = pos_emb.size(0)
         p = self.linear_pos(pos_emb).view(n_batch_pos, -1, self.h, self.d_k)
         p = p.transpose(1, 2)  # (batch, head, time1, d_k)
 
-        # (batch, head, time1, d_k)
-        q_with_bias_u = (q + self.pos_bias_u).transpose(1, 2)
-        # (batch, head, time1, d_k)
-        q_with_bias_v = (q + self.pos_bias_v).transpose(1, 2)
+        q_with_bias_u = q + self.pos_bias_u.unsqueeze(0).unsqueeze(2)
+        q_with_bias_v = q + self.pos_bias_v.unsqueeze(0).unsqueeze(2)
 
-        # compute attention score
-        # first compute matrix a and matrix c
-        # as described in https://arxiv.org/abs/1901.02860 Section 3.3
-        # (batch, head, time1, time2)
+        if self._can_use_triton_relpos_attention(query, pos_emb, mask, pad_mask):
+            return self._forward_triton_relpos_attention(
+                q_with_bias_u,
+                q_with_bias_v,
+                k,
+                v,
+                p,
+                mask,
+                pad_mask,
+            )
 
         # compute matrix b and matrix d
         # (batch, head, time1, time2)
         matrix_bd = torch.matmul(q_with_bias_v, p.transpose(-2, -1))
         matrix_bd = self.rel_shift(matrix_bd)
 
-        # drops extra elements in the matrix_bd to match the matrix_ac's size
-        matrix_ac = torch.matmul(q_with_bias_u, k.transpose(-2, -1))
-        matrix_bd = matrix_bd[:, :, :, : matrix_ac.size(-1)]
-        scores = (matrix_ac + matrix_bd) / self.s_d_k  # (batch, head, time1, time2)
-        return self.forward_attention(v, scores, mask)
+        # Drop extra relative positions to match the key sequence length.
+        matrix_bd = matrix_bd[:, :, :, : k.size(-2)]
+        return self.forward_attention(
+            q_with_bias_u,
+            k,
+            v,
+            mask,
+            pad_mask=pad_mask,
+            attn_bias=matrix_bd,
+        )
 
 
 class ConformerLayer(torch.nn.Module):
@@ -1291,6 +1430,7 @@ class ConformerLayer(torch.nn.Module):
                 value=x,
                 mask=att_mask,
                 pos_emb=pos_emb,
+                pad_mask=pad_mask,
             )
         elif self.self_attention_model == "rel_pos_local_attn":
             x = self.self_attn(
@@ -1301,7 +1441,13 @@ class ConformerLayer(torch.nn.Module):
                 pos_emb=pos_emb,
             )
         elif self.self_attention_model == "abs_pos":
-            x = self.self_attn(query=x, key=x, value=x, mask=att_mask)
+            x = self.self_attn(
+                query=x,
+                key=x,
+                value=x,
+                mask=att_mask,
+                pad_mask=pad_mask,
+            )
         else:
             x = None
 
@@ -1549,42 +1695,48 @@ class ConformerEncoder(nn.Module):
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self.self_attention_model != "rel_pos_local_attn":
-            att_mask = torch.ones(
-                1, max_audio_length, max_audio_length, dtype=torch.bool, device=device
-            )
+            if att_context_size[0] < 0 and att_context_size[1] < 0:
+                att_mask = None
+            else:
+                att_mask = torch.ones(
+                    1, max_audio_length, max_audio_length, dtype=torch.bool, device=device
+                )
 
-            if self.att_context_style == "regular":
-                if att_context_size[0] >= 0:
-                    att_mask = att_mask.triu(diagonal=-att_context_size[0])
-                if att_context_size[1] >= 0:
-                    att_mask = att_mask.tril(diagonal=att_context_size[1])
-            elif self.att_context_style == "chunked_limited":
-                # When right context is unlimited, just the
-                # left side of masking needs to get updated
-                if att_context_size[1] == -1:
+                if self.att_context_style == "regular":
                     if att_context_size[0] >= 0:
                         att_mask = att_mask.triu(diagonal=-att_context_size[0])
-                else:
-                    chunk_size = att_context_size[1] + 1
-                    # left_chunks_num specifies the number
-                    # of chunks to be visible by each chunk
-                    # on the left side
-                    if att_context_size[0] >= 0:
-                        left_chunks_num = att_context_size[0] // chunk_size
+                    if att_context_size[1] >= 0:
+                        att_mask = att_mask.tril(diagonal=att_context_size[1])
+                elif self.att_context_style == "chunked_limited":
+                    # When right context is unlimited, just the
+                    # left side of masking needs to get updated
+                    if att_context_size[1] == -1:
+                        if att_context_size[0] >= 0:
+                            att_mask = att_mask.triu(diagonal=-att_context_size[0])
                     else:
-                        left_chunks_num = 10000
+                        chunk_size = att_context_size[1] + 1
+                        # left_chunks_num specifies the number
+                        # of chunks to be visible by each chunk
+                        # on the left side
+                        if att_context_size[0] >= 0:
+                            left_chunks_num = att_context_size[0] // chunk_size
+                        else:
+                            left_chunks_num = 10000
 
-                    chunk_idx = torch.arange(
-                        0, max_audio_length, dtype=torch.int, device=att_mask.device
-                    )
-                    chunk_idx = torch.div(chunk_idx, chunk_size, rounding_mode="trunc")
-                    diff_chunks = chunk_idx.unsqueeze(1) - chunk_idx.unsqueeze(0)
-                    chunked_limited_mask = torch.logical_and(
-                        torch.le(diff_chunks, left_chunks_num), torch.ge(diff_chunks, 0)
-                    )
-                    att_mask = torch.logical_and(
-                        att_mask, chunked_limited_mask.unsqueeze(0)
-                    )
+                        chunk_idx = torch.arange(
+                            0, max_audio_length, dtype=torch.int, device=att_mask.device
+                        )
+                        chunk_idx = torch.div(
+                            chunk_idx, chunk_size, rounding_mode="trunc"
+                        )
+                        diff_chunks = chunk_idx.unsqueeze(1) - chunk_idx.unsqueeze(0)
+                        chunked_limited_mask = torch.logical_and(
+                            torch.le(diff_chunks, left_chunks_num),
+                            torch.ge(diff_chunks, 0),
+                        )
+                        att_mask = torch.logical_and(
+                            att_mask, chunked_limited_mask.unsqueeze(0)
+                        )
         else:
             att_mask = None
 
@@ -1600,23 +1752,9 @@ class ConformerEncoder(nn.Module):
             pad_mask = pad_mask_off.logical_and(pad_mask)
 
         if att_mask is not None:
-            # pad_mask_for_att_mask is the mask which helps to ignore paddings
-            pad_mask_for_att_mask = pad_mask.unsqueeze(1).repeat(
-                [1, max_audio_length, 1]
-            )
-            pad_mask_for_att_mask = torch.logical_and(
-                pad_mask_for_att_mask, pad_mask_for_att_mask.transpose(1, 2)
-            )
-            # att_mask is the masking to be used by MHA
-            # layers to ignore tokens not supposed to be
-            # visible
+            # Keep the context mask broadcastable so SDPA does not need a
+            # per-batch (B, T, T) materialized attention mask.
             att_mask = att_mask[:, :max_audio_length, :max_audio_length]
-            # paddings should also get ignored, so
-            # pad_mask_for_att_mask is used to ignore their
-            # corresponding scores
-            att_mask = torch.logical_and(
-                pad_mask_for_att_mask, att_mask.to(pad_mask_for_att_mask.device)
-            )
             att_mask = ~att_mask
 
         pad_mask = ~pad_mask
@@ -1764,6 +1902,9 @@ class CohereASRModel(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
+            (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
+            (".self_attn.qkv_proj", ".self_attn.k_proj", "k"),
+            (".self_attn.qkv_proj", ".self_attn.v_proj", "v"),
             (".first_sub_layer.qkv_proj", ".first_sub_layer.query_net", "q"),
             (".first_sub_layer.qkv_proj", ".first_sub_layer.key_net", "k"),
             (".first_sub_layer.qkv_proj", ".first_sub_layer.value_net", "v"),
@@ -1996,7 +2137,13 @@ class CohereASRForConditionalGeneration(
     }
 
     hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={".fc1.": ".mlp.fc1.", ".fc2.": ".mlp.fc2."}
+        orig_to_new_substr={
+            ".fc1.": ".mlp.fc1.",
+            ".fc2.": ".mlp.fc2.",
+            ".linear_q.": ".q_proj.",
+            ".linear_k.": ".k_proj.",
+            ".linear_v.": ".v_proj.",
+        }
     )
 
     supports_transcription_only = True
