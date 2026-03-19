@@ -25,6 +25,7 @@ from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.async_utils import AsyncMicrobatchTokenizer
 from vllm.utils.counter import AtomicCounter
+from vllm.utils.stage_timing import StageTimingRegistry
 from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.metrics.stats import MultiModalCacheStats
 
@@ -56,6 +57,12 @@ if TYPE_CHECKING:
     from vllm.multimodal.processing import BaseMultiModalProcessor
 
 logger = init_logger(__name__)
+
+RENDERER_TIMING_STATS = StageTimingRegistry()
+
+
+def get_and_reset_renderer_timing_stats() -> dict[str, dict[str, float | int]]:
+    return RENDERER_TIMING_STATS.snapshot_and_reset()
 
 
 _T = TypeVar("_T", bound=TokenizerLike, default=TokenizerLike)
@@ -502,11 +509,40 @@ class BaseRenderer(ABC, Generic[_T]):
 
         return await self._tokenize_singleton_prompt_async(prompt, params)
 
+    @staticmethod
+    def _is_already_tokenized_prompt(prompt: SingletonDictPrompt) -> bool:
+        return "prompt_token_ids" in prompt or "prompt_embeds" in prompt
+
+    def _can_skip_async_tokenize(
+        self,
+        prompts: Sequence[DictPrompt],
+        params: TokenizeParams,
+    ) -> bool:
+        if params.needs_detokenization:
+            return False
+
+        for prompt in prompts:
+            if "encoder_prompt" in prompt:
+                if not self._is_already_tokenized_prompt(prompt["encoder_prompt"]):
+                    return False
+                dec_prompt = prompt["decoder_prompt"]
+                if dec_prompt is not None and not self._is_already_tokenized_prompt(
+                    dec_prompt
+                ):
+                    return False
+            elif not self._is_already_tokenized_prompt(prompt):
+                return False
+
+        return True
+
     async def tokenize_prompts_async(
         self,
         prompts: Sequence[DictPrompt],
         params: TokenizeParams,
     ) -> list[TokPrompt]:
+        if self._can_skip_async_tokenize(prompts, params):
+            return self.tokenize_prompts(prompts, params)
+
         return await asyncio.gather(
             *(self.tokenize_prompt_async(prompt, params) for prompt in prompts)
         )
@@ -620,8 +656,9 @@ class BaseRenderer(ABC, Generic[_T]):
             tokenization_kwargs=tokenization_kwargs or {},
         )
         mm_timing_ctx = self._mm_timing_registry.get(mm_req_id)
+        num_threads = mm_processor.get_torch_num_threads(mm_processor_inputs)
 
-        with set_default_torch_num_threads():
+        with set_default_torch_num_threads(num_threads):
             mm_inputs = mm_processor.apply(mm_processor_inputs, mm_timing_ctx)
 
         self.update_mm_cache_stats()
@@ -756,17 +793,25 @@ class BaseRenderer(ABC, Generic[_T]):
         *,
         prompt_extras: dict[str, Any] | None = None,
     ):
-        arrival_time = time.time()
+        with RENDERER_TIMING_STATS.record("render_cmpl_total_secs"):
+            arrival_time = time.time()
 
-        if tok_params is None:
-            tok_params = self.default_cmpl_tok_params
+            if tok_params is None:
+                tok_params = self.default_cmpl_tok_params
 
-        dict_prompts = await self.render_prompts_async(prompts)
-        tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
+            with RENDERER_TIMING_STATS.record("render_prompts_secs"):
+                dict_prompts = await self.render_prompts_async(prompts)
+            with RENDERER_TIMING_STATS.record("tokenize_prompts_secs"):
+                tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
 
-        self._apply_prompt_extras(tok_prompts, prompt_extras)
+            with RENDERER_TIMING_STATS.record("apply_prompt_extras_secs"):
+                self._apply_prompt_extras(tok_prompts, prompt_extras)
 
-        return [self.process_for_engine(prompt, arrival_time) for prompt in tok_prompts]
+            with RENDERER_TIMING_STATS.record("process_for_engine_secs"):
+                return [
+                    self.process_for_engine(prompt, arrival_time)
+                    for prompt in tok_prompts
+                ]
 
     def render_chat(
         self,

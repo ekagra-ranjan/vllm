@@ -31,6 +31,7 @@ from vllm.utils.network_utils import (
     get_open_zmq_inproc_path,
     make_zmq_socket,
 )
+from vllm.utils.stage_timing import StageTimingRegistry
 from vllm.v1.engine import (
     EEP_NOTIFICATION_CALL_ID,
     EEPNotificationType,
@@ -56,6 +57,12 @@ from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
 logger = init_logger(__name__)
+
+CORE_CLIENT_TIMING_STATS = StageTimingRegistry()
+
+
+def get_and_reset_core_client_timing_stats() -> dict[str, dict[str, float | int]]:
+    return CORE_CLIENT_TIMING_STATS.snapshot_and_reset()
 
 AnyFuture: TypeAlias = asyncio.Future[Any] | Future[Any]
 
@@ -822,16 +829,27 @@ class SyncMPClient(MPClient):
     def _send_input(self, request_type: EngineCoreRequestType, request: Any):
         self.ensure_alive()
         self.free_pending_messages()
+        should_time = request_type == EngineCoreRequestType.ADD
         # (Identity, RequestType, SerializedRequest)
-        msg = (self.core_engine, request_type.value, *self.encoder.encode(request))
+        if should_time:
+            with CORE_CLIENT_TIMING_STATS.record("request_encode_secs"):
+                encoded_request = self.encoder.encode(request)
+        else:
+            encoded_request = self.encoder.encode(request)
+        msg = (self.core_engine, request_type.value, *encoded_request)
 
-        if len(msg) <= 3:
-            # No auxiliary buffers => no tensor backing buffers in request.
-            self.input_socket.send_multipart(msg, copy=False)
-            return
+        with (
+            CORE_CLIENT_TIMING_STATS.record("request_send_secs")
+            if should_time
+            else contextlib.nullcontext()
+        ):
+            if len(msg) <= 3:
+                # No auxiliary buffers => no tensor backing buffers in request.
+                self.input_socket.send_multipart(msg, copy=False)
+                return
 
-        tracker = self.input_socket.send_multipart(msg, copy=False, track=True)
-        self.add_pending_message(tracker, request)
+            tracker = self.input_socket.send_multipart(msg, copy=False, track=True)
+            self.add_pending_message(tracker, request)
 
     def call_utility(self, method: str, *args) -> Any:
         call_id = uuid.uuid1().int >> 64
@@ -1031,11 +1049,24 @@ class AsyncMPClient(MPClient):
         if engine is None:
             engine = self.core_engine
 
-        message = (request_type.value, *self.encoder.encode(request))
-        return self._send_input_message(message, engine, request)
+        should_time = request_type == EngineCoreRequestType.ADD
+        if should_time:
+            with CORE_CLIENT_TIMING_STATS.record("request_encode_secs"):
+                encoded_request = self.encoder.encode(request)
+        else:
+            encoded_request = self.encoder.encode(request)
+        message = (request_type.value, *encoded_request)
+        return self._send_input_message(
+            message, engine, request, record_send_timing=should_time
+        )
 
     def _send_input_message(
-        self, message: tuple[bytestr, ...], engine: EngineIdentity, objects: Any
+        self,
+        message: tuple[bytestr, ...],
+        engine: EngineIdentity,
+        objects: Any,
+        *,
+        record_send_timing: bool = False,
     ) -> Awaitable[Any]:
         """
         objects is a reference to retain until zmq is finished with the
@@ -1045,12 +1076,18 @@ class AsyncMPClient(MPClient):
         self.free_pending_messages()
 
         msg = (engine,) + message
-        if not objects or len(msg) <= 3:
-            # No auxiliary buffers => no tensor backing buffers in request.
-            return self.input_socket.send_multipart(msg, copy=False)
+        timing_ctx = (
+            CORE_CLIENT_TIMING_STATS.record("request_send_secs")
+            if record_send_timing
+            else contextlib.nullcontext()
+        )
+        with timing_ctx:
+            if not objects or len(msg) <= 3:
+                # No auxiliary buffers => no tensor backing buffers in request.
+                return self.input_socket.send_multipart(msg, copy=False)
 
-        future: asyncio.Future[zmq.MessageTracker]
-        future = self.input_socket.send_multipart(msg, copy=False, track=True)
+            future: asyncio.Future[zmq.MessageTracker]
+            future = self.input_socket.send_multipart(msg, copy=False, track=True)
 
         def add_pending(f: asyncio.Future[zmq.MessageTracker]):
             with contextlib.suppress(BaseException):

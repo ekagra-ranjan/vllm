@@ -6,8 +6,9 @@ import math
 import time
 import zlib
 from collections.abc import AsyncGenerator, Callable
-from functools import cached_property
-from typing import Final, Literal, TypeAlias, TypeVar, cast
+from concurrent.futures import ThreadPoolExecutor
+from functools import cached_property, partial
+from typing import Any, Final, Literal, TypeAlias, TypeVar, cast
 
 import numpy as np
 from fastapi import Request
@@ -50,6 +51,7 @@ from vllm.renderers.inputs.preprocess import parse_enc_dec_prompt, parse_model_p
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import get_tokenizer
 from vllm.utils.import_utils import PlaceholderModule
+from vllm.utils.stage_timing import StageTimingRegistry
 
 try:
     import librosa
@@ -86,6 +88,101 @@ ResponseType: TypeAlias = (
 )
 
 logger = init_logger(__name__)
+
+SPEECH_TO_TEXT_TIMING_STATS = StageTimingRegistry()
+_CROSS_REQUEST_AUDIO_MICROBATCH_MAX_BATCH_SIZE = 16
+_CROSS_REQUEST_AUDIO_MICROBATCH_WAIT_TIMEOUT_S = 0.002
+
+
+def get_and_reset_speech_to_text_timing_stats() -> dict[str, dict[str, float | int]]:
+    return SPEECH_TO_TEXT_TIMING_STATS.snapshot_and_reset()
+
+
+def _record_speech_observation(stage: str, value: float) -> None:
+    SPEECH_TO_TEXT_TIMING_STATS.add(stage, value)
+
+
+class AsyncMicrobatchAudioPreprocessor:
+    """Microbatch single-clip requests across concurrent calls."""
+
+    def __init__(
+        self,
+        preprocess_fn: Callable[[list[np.ndarray], object], list[dict[str, Any]]],
+        model_config: object,
+        *,
+        max_batch_size: int = _CROSS_REQUEST_AUDIO_MICROBATCH_MAX_BATCH_SIZE,
+        batch_wait_timeout_s: float = _CROSS_REQUEST_AUDIO_MICROBATCH_WAIT_TIMEOUT_S,
+    ) -> None:
+        self.preprocess_fn = preprocess_fn
+        self.model_config = model_config
+        self.max_batch_size = max_batch_size
+        self.batch_wait_timeout_s = batch_wait_timeout_s
+        self._loop = asyncio.get_running_loop()
+        self._queue: asyncio.Queue[tuple[np.ndarray, asyncio.Future[dict[str, Any]], float]] = (
+            asyncio.Queue()
+        )
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._batcher_task = self._loop.create_task(self._batch_loop())
+
+    async def preprocess(self, chunk: np.ndarray) -> dict[str, Any]:
+        result_future: asyncio.Future[dict[str, Any]] = self._loop.create_future()
+        enqueue_time = time.perf_counter()
+        await self._queue.put((chunk, result_future, enqueue_time))
+        return await result_future
+
+    async def _batch_loop(self) -> None:
+        while True:
+            chunk, result_future, enqueue_time = await self._queue.get()
+            chunks = [chunk]
+            result_futures = [result_future]
+            enqueue_times = [enqueue_time]
+            deadline = self._loop.time() + self.batch_wait_timeout_s
+
+            while len(chunks) < self.max_batch_size:
+                timeout = deadline - self._loop.time()
+                if timeout <= 0:
+                    break
+                try:
+                    chunk, result_future, enqueue_time = await asyncio.wait_for(
+                        self._queue.get(), timeout
+                    )
+                except asyncio.TimeoutError:
+                    break
+
+                chunks.append(chunk)
+                result_futures.append(result_future)
+                enqueue_times.append(enqueue_time)
+
+            if envs.VLLM_SERVER_DEV_MODE:
+                _record_speech_observation(
+                    "audio_feature_cross_request_microbatch_batch_size_items",
+                    float(len(chunks)),
+                )
+                _record_speech_observation(
+                    "audio_feature_cross_request_microbatch_raw_samples",
+                    float(sum(chunk.shape[0] for chunk in chunks)),
+                )
+                _record_speech_observation(
+                    "audio_feature_cross_request_microbatch_wait_secs",
+                    time.perf_counter() - min(enqueue_times),
+                )
+
+            try:
+                preprocess_fn = partial(self.preprocess_fn, chunks, self.model_config)
+                results = await self._loop.run_in_executor(self._executor, preprocess_fn)
+                for future, result in zip(result_futures, results):
+                    if not future.done():
+                        future.set_result(result)
+            except Exception as exc:
+                for future in result_futures:
+                    if not future.done():
+                        future.set_exception(exc)
+
+    def __del__(self) -> None:
+        batcher_task = getattr(self, "_batcher_task", None)
+        loop = getattr(self, "_loop", None)
+        if batcher_task is not None and loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(batcher_task.cancel)
 
 
 class OpenAISpeechToText(OpenAIServing):
@@ -140,6 +237,27 @@ class OpenAISpeechToText(OpenAIServing):
 
         model_cls = get_model_cls(self.model_config)
         return cast(type[SupportsTranscription], model_cls)
+
+    def warmup(self) -> None:
+        warmup_prompt_cache = getattr(self.model_cls, "warmup_prompt_token_cache", None)
+        if callable(warmup_prompt_cache):
+            warmup_prompt_cache(self.model_config)
+
+    @cached_property
+    def _async_audio_preprocessor(self) -> AsyncMicrobatchAudioPreprocessor | None:
+        if not envs.VLLM_COHERE_ASR_CROSS_REQUEST_AUDIO_MICROBATCH:
+            return None
+
+        batch_preprocess_audio = getattr(
+            self.model_cls, "batch_preprocess_audio_chunks", None
+        )
+        if not callable(batch_preprocess_audio):
+            return None
+
+        return AsyncMicrobatchAudioPreprocessor(
+            batch_preprocess_audio,
+            self.model_config,
+        )
 
     async def _detect_language(
         self,
@@ -212,30 +330,33 @@ class OpenAISpeechToText(OpenAIServing):
         # transparently falls back to ffmpeg via an in-memory fd.
         # NOTE resample to model SR here for efficiency. This is also a
         # pre-requisite for chunking, as it assumes Whisper SR.
-        try:
-            with io.BytesIO(audio_data) as buf:
-                y, sr = librosa.load(buf, sr=self.asr_config.sample_rate)  # type: ignore[return-value]
-        except sf.LibsndfileError as exc:
-            # Only fall back for known format-detection failures.
-            # Re-raise anything else (e.g. corrupt but recognised format).
-            if exc.code not in _BAD_SF_CODES:
-                raise
-            logger.debug(
-                "librosa/soundfile could not decode audio from BytesIO "
-                "(code=%s: %s); falling back to pyav in-process decode",
-                exc.code,
-                exc,
-            )
+        with SPEECH_TO_TEXT_TIMING_STATS.record("audio_decode_resample_secs"):
             try:
-                native_y, native_sr = extract_audio_from_video_bytes(audio_data)
-                sr = self.asr_config.sample_rate
-                y = librosa.resample(native_y, orig_sr=native_sr, target_sr=sr)
-            except Exception as pyav_exc:
+                with io.BytesIO(audio_data) as buf:
+                    y, sr = librosa.load(buf, sr=self.asr_config.sample_rate)  # type: ignore[return-value]
+            except sf.LibsndfileError as exc:
+                # Only fall back for known format-detection failures.
+                # Re-raise anything else (e.g. corrupt but recognised format).
+                if exc.code not in _BAD_SF_CODES:
+                    raise
                 logger.debug(
-                    "pyAV fallback also failed: %s",
-                    pyav_exc,
+                    "librosa/soundfile could not decode audio from BytesIO "
+                    "(code=%s: %s); falling back to pyav in-process decode",
+                    exc.code,
+                    exc,
                 )
-                raise ValueError("Invalid or unsupported audio file.") from pyav_exc
+                try:
+                    native_y, native_sr = extract_audio_from_video_bytes(audio_data)
+                    sr = self.asr_config.sample_rate
+                    y = librosa.resample(native_y, orig_sr=native_sr, target_sr=sr)
+                except Exception as pyav_exc:
+                    logger.debug(
+                        "pyAV fallback also failed: %s",
+                        pyav_exc,
+                    )
+                    raise ValueError(
+                        "Invalid or unsupported audio file."
+                    ) from pyav_exc
 
         duration = librosa.get_duration(y=y, sr=sr)
         do_split_audio = (
@@ -246,49 +367,74 @@ class OpenAISpeechToText(OpenAIServing):
         if not do_split_audio:
             chunks = [y]
         else:
-            assert self.asr_config.max_audio_clip_s is not None
-            assert self.asr_config.min_energy_split_window_size is not None
-            chunks = split_audio(
-                audio_data=y,
-                sample_rate=int(sr),
-                max_clip_duration_s=self.asr_config.max_audio_clip_s,
-                overlap_duration_s=self.asr_config.overlap_chunk_second,
-                min_energy_window_size=self.asr_config.min_energy_split_window_size,
-            )
+            with SPEECH_TO_TEXT_TIMING_STATS.record("audio_chunking_secs"):
+                assert self.asr_config.max_audio_clip_s is not None
+                assert self.asr_config.min_energy_split_window_size is not None
+                chunks = split_audio(
+                    audio_data=y,
+                    sample_rate=int(sr),
+                    max_clip_duration_s=self.asr_config.max_audio_clip_s,
+                    overlap_duration_s=self.asr_config.overlap_chunk_second,
+                    min_energy_window_size=self.asr_config.min_energy_split_window_size,
+                )
 
         if language is None and getattr(
             self.model_cls, "supports_explicit_language_detection", False
         ):
             # Auto-detect language from the first chunk.
-            language = await self._detect_language(
-                chunks[0], f"{request_id}-lang_detect"
-            )
+            with SPEECH_TO_TEXT_TIMING_STATS.record("language_detect_secs"):
+                language = await self._detect_language(
+                    chunks[0], f"{request_id}-lang_detect"
+                )
             request.language = language
 
-        parsed_prompts: list[DictPrompt] = []
-        for chunk in chunks:
-            # The model has control over the construction, as long as it
-            # returns a valid PromptType.
-            prompt = self.model_cls.get_generation_prompt(
-                audio=chunk,
-                stt_config=self.asr_config,
-                model_config=self.model_config,
-                language=language,
-                task_type=self.task_type,
-                request_prompt=request.prompt,
-                to_language=to_language,
-            )
+        preprocessed_chunks = None
+        batch_preprocess_audio = getattr(
+            self.model_cls, "batch_preprocess_audio_chunks", None
+        )
+        if callable(batch_preprocess_audio):
+            if len(chunks) > 1:
+                with SPEECH_TO_TEXT_TIMING_STATS.record("audio_feature_microbatch_secs"):
+                    preprocessed_chunks = batch_preprocess_audio(
+                        chunks,
+                        self.model_config,
+                    )
+            elif len(chunks) == 1 and self._async_audio_preprocessor is not None:
+                with SPEECH_TO_TEXT_TIMING_STATS.record("audio_feature_microbatch_secs"):
+                    preprocessed_chunks = [
+                        await self._async_audio_preprocessor.preprocess(chunks[0])
+                    ]
 
-            parsed_prompt: DictPrompt
-            if request.response_format == "verbose_json":
-                parsed_prompt = parse_enc_dec_prompt(prompt)
-                parsed_prompt = self._preprocess_verbose_prompt(parsed_prompt)
-            else:
-                parsed_prompt = parse_model_prompt(self.model_config, prompt)
+        with SPEECH_TO_TEXT_TIMING_STATS.record("prompt_build_secs"):
+            parsed_prompts: list[DictPrompt] = []
+            for chunk_idx, chunk in enumerate(chunks):
+                # The model has control over the construction, as long as it
+                # returns a valid PromptType.
+                prompt = self.model_cls.get_generation_prompt(
+                    audio=chunk,
+                    stt_config=self.asr_config,
+                    model_config=self.model_config,
+                    language=language,
+                    task_type=self.task_type,
+                    request_prompt=request.prompt,
+                    to_language=to_language,
+                )
+                if preprocessed_chunks is not None:
+                    prompt["multi_modal_data"] = {
+                        "audio": preprocessed_chunks[chunk_idx],
+                    }
 
-            parsed_prompts.append(parsed_prompt)
+                parsed_prompt: DictPrompt
+                if request.response_format == "verbose_json":
+                    parsed_prompt = parse_enc_dec_prompt(prompt)
+                    parsed_prompt = self._preprocess_verbose_prompt(parsed_prompt)
+                else:
+                    parsed_prompt = parse_model_prompt(self.model_config, prompt)
 
-        engine_prompts = await self.renderer.render_cmpl_async(parsed_prompts)
+                parsed_prompts.append(parsed_prompt)
+
+        with SPEECH_TO_TEXT_TIMING_STATS.record("renderer_render_secs"):
+            engine_prompts = await self.renderer.render_cmpl_async(parsed_prompts)
 
         return engine_prompts, duration
 

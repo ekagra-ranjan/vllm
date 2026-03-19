@@ -136,6 +136,8 @@ def init_transcription_state(
         if "transcription" in supported_tasks
         else None
     )
+    if state.openai_serving_transcription is not None:
+        state.openai_serving_transcription.warmup()
     state.openai_serving_translation = (
         OpenAIServingTranslation(
             engine_client,

@@ -187,16 +187,360 @@ def _cohere_asr_relpos_fwd_kernel(
     )
 
 
-def _get_query_block_size(dtype: torch.dtype) -> int:
+@triton.jit
+def _cohere_asr_relpos_splitd_fwd_kernel(
+    Q_U,
+    Q_V,
+    K,
+    V,
+    P,
+    MASK,
+    sm_scale,
+    center_pos,
+    pos_len,
+    B_Start_Loc,
+    B_Seqlen,
+    Out,
+    stride_qbs,
+    stride_qh,
+    stride_kbs,
+    stride_kh,
+    stride_vbs,
+    stride_vh,
+    stride_ph,
+    stride_pp,
+    stride_mbatch,
+    stride_mq,
+    stride_mk,
+    stride_obs,
+    stride_oh,
+    HAS_MASK: tl.constexpr,
+    MASK_BATCH_BROADCAST: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    CHUNK_0: tl.constexpr,
+    CHUNK_1: tl.constexpr,
+    CHUNK_2: tl.constexpr,
+    CHUNK_3: tl.constexpr,
+):
+    cur_batch = tl.program_id(0)
+    cur_head = tl.program_id(1)
+    start_m = tl.program_id(2)
+
+    cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
+    cur_batch_start = tl.load(B_Start_Loc + cur_batch)
+    block_start_loc = BLOCK_M * start_m
+
+    offs_m = block_start_loc + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+
+    q_valid = offs_m < cur_batch_seq_len
+
+    q_base_offsets = (
+        (cur_batch_start + offs_m[:, None]) * stride_qbs + cur_head * stride_qh
+    )
+    q_v_base_offsets = (
+        (cur_batch_start + offs_m[None, :]) * stride_qbs + cur_head * stride_qh
+    )
+
+    offs_d0 = tl.arange(0, CHUNK_0)
+    q_u_0 = tl.load(
+        Q_U + q_base_offsets + offs_d0[None, :],
+        mask=q_valid[:, None],
+        other=0.0,
+    )
+    q_v_0 = tl.load(
+        Q_V + q_v_base_offsets + offs_d0[:, None],
+        mask=q_valid[None, :],
+        other=0.0,
+    )
+    acc_0 = tl.zeros([BLOCK_M, CHUNK_0], dtype=tl.float32)
+
+    if CHUNK_1 > 0:
+        offs_d1 = CHUNK_0 + tl.arange(0, CHUNK_1)
+        q_u_1 = tl.load(
+            Q_U + q_base_offsets + offs_d1[None, :],
+            mask=q_valid[:, None],
+            other=0.0,
+        )
+        q_v_1 = tl.load(
+            Q_V + q_v_base_offsets + offs_d1[:, None],
+            mask=q_valid[None, :],
+            other=0.0,
+        )
+        acc_1 = tl.zeros([BLOCK_M, CHUNK_1], dtype=tl.float32)
+
+    if CHUNK_2 > 0:
+        offs_d2 = CHUNK_0 + CHUNK_1 + tl.arange(0, CHUNK_2)
+        q_u_2 = tl.load(
+            Q_U + q_base_offsets + offs_d2[None, :],
+            mask=q_valid[:, None],
+            other=0.0,
+        )
+        q_v_2 = tl.load(
+            Q_V + q_v_base_offsets + offs_d2[:, None],
+            mask=q_valid[None, :],
+            other=0.0,
+        )
+        acc_2 = tl.zeros([BLOCK_M, CHUNK_2], dtype=tl.float32)
+
+    if CHUNK_3 > 0:
+        offs_d3 = CHUNK_0 + CHUNK_1 + CHUNK_2 + tl.arange(0, CHUNK_3)
+        q_u_3 = tl.load(
+            Q_U + q_base_offsets + offs_d3[None, :],
+            mask=q_valid[:, None],
+            other=0.0,
+        )
+        q_v_3 = tl.load(
+            Q_V + q_v_base_offsets + offs_d3[:, None],
+            mask=q_valid[None, :],
+            other=0.0,
+        )
+        acc_3 = tl.zeros([BLOCK_M, CHUNK_3], dtype=tl.float32)
+
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    end_n = cur_batch_seq_len
+    for start_n in range(0, end_n, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        key_pos = start_n + offs_n
+        k_valid = key_pos < cur_batch_seq_len
+
+        k_base_offsets = (
+            (cur_batch_start + key_pos[None, :]) * stride_kbs + cur_head * stride_kh
+        )
+        v_base_offsets = (
+            (cur_batch_start + key_pos[:, None]) * stride_vbs + cur_head * stride_vh
+        )
+
+        k_0 = tl.load(
+            K + k_base_offsets + offs_d0[:, None],
+            mask=k_valid[None, :],
+            other=0.0,
+        )
+        v_0 = tl.load(
+            V + v_base_offsets + offs_d0[None, :],
+            mask=k_valid[:, None],
+            other=0.0,
+        )
+        qk = tl.dot(q_u_0, k_0).to(tl.float32)
+
+        if CHUNK_1 > 0:
+            k_1 = tl.load(
+                K + k_base_offsets + offs_d1[:, None],
+                mask=k_valid[None, :],
+                other=0.0,
+            )
+            v_1 = tl.load(
+                V + v_base_offsets + offs_d1[None, :],
+                mask=k_valid[:, None],
+                other=0.0,
+            )
+            qk += tl.dot(q_u_1, k_1).to(tl.float32)
+
+        if CHUNK_2 > 0:
+            k_2 = tl.load(
+                K + k_base_offsets + offs_d2[:, None],
+                mask=k_valid[None, :],
+                other=0.0,
+            )
+            v_2 = tl.load(
+                V + v_base_offsets + offs_d2[None, :],
+                mask=k_valid[:, None],
+                other=0.0,
+            )
+            qk += tl.dot(q_u_2, k_2).to(tl.float32)
+
+        if CHUNK_3 > 0:
+            k_3 = tl.load(
+                K + k_base_offsets + offs_d3[:, None],
+                mask=k_valid[None, :],
+                other=0.0,
+            )
+            v_3 = tl.load(
+                V + v_base_offsets + offs_d3[None, :],
+                mask=k_valid[:, None],
+                other=0.0,
+            )
+            qk += tl.dot(q_u_3, k_3).to(tl.float32)
+
+        rel_pos = center_pos + key_pos[None, :] - offs_m[:, None]
+        rel_valid = q_valid[:, None] & k_valid[None, :] & (rel_pos >= 0) & (rel_pos < pos_len)
+        p_0 = tl.load(
+            P
+            + cur_head * stride_ph
+            + rel_pos[None, :, :] * stride_pp
+            + offs_d0[:, None, None],
+            mask=rel_valid[None, :, :],
+            other=0.0,
+        )
+        rel_qk = tl.sum(
+            q_v_0[:, :, None].to(tl.float32) * p_0.to(tl.float32),
+            axis=0,
+        )
+
+        if CHUNK_1 > 0:
+            p_1 = tl.load(
+                P
+                + cur_head * stride_ph
+                + rel_pos[None, :, :] * stride_pp
+                + offs_d1[:, None, None],
+                mask=rel_valid[None, :, :],
+                other=0.0,
+            )
+            rel_qk += tl.sum(
+                q_v_1[:, :, None].to(tl.float32) * p_1.to(tl.float32),
+                axis=0,
+            )
+
+        if CHUNK_2 > 0:
+            p_2 = tl.load(
+                P
+                + cur_head * stride_ph
+                + rel_pos[None, :, :] * stride_pp
+                + offs_d2[:, None, None],
+                mask=rel_valid[None, :, :],
+                other=0.0,
+            )
+            rel_qk += tl.sum(
+                q_v_2[:, :, None].to(tl.float32) * p_2.to(tl.float32),
+                axis=0,
+            )
+
+        if CHUNK_3 > 0:
+            p_3 = tl.load(
+                P
+                + cur_head * stride_ph
+                + rel_pos[None, :, :] * stride_pp
+                + offs_d3[:, None, None],
+                mask=rel_valid[None, :, :],
+                other=0.0,
+            )
+            rel_qk += tl.sum(
+                q_v_3[:, :, None].to(tl.float32) * p_3.to(tl.float32),
+                axis=0,
+            )
+
+        score_mask = q_valid[:, None] & k_valid[None, :]
+        if HAS_MASK:
+            mask_batch = 0 if MASK_BATCH_BROADCAST else cur_batch
+            mask_offsets = (
+                mask_batch * stride_mbatch
+                + offs_m[:, None] * stride_mq
+                + key_pos[None, :] * stride_mk
+            )
+            blocked = tl.load(
+                MASK + mask_offsets,
+                mask=score_mask,
+                other=True,
+            )
+            score_mask &= ~blocked
+
+        qk = (qk + rel_qk) * sm_scale
+        masked_qk = tl.where(score_mask, qk, -1.0e8)
+        m_ij = tl.maximum(m_i, tl.max(masked_qk, axis=1))
+        p = tl.where(score_mask, tl.math.exp2(masked_qk - m_ij[:, None]), 0.0)
+        l_ij = tl.sum(p, axis=1)
+
+        alpha = tl.math.exp2(m_i - m_ij)
+        p_weights = p.to(v_0.dtype)
+        acc_0 = acc_0 * alpha[:, None]
+        acc_0 = tl.dot(p_weights, v_0, acc_0)
+        if CHUNK_1 > 0:
+            acc_1 = acc_1 * alpha[:, None]
+            acc_1 = tl.dot(p_weights, v_1, acc_1)
+        if CHUNK_2 > 0:
+            acc_2 = acc_2 * alpha[:, None]
+            acc_2 = tl.dot(p_weights, v_2, acc_2)
+        if CHUNK_3 > 0:
+            acc_3 = acc_3 * alpha[:, None]
+            acc_3 = tl.dot(p_weights, v_3, acc_3)
+
+        l_i = l_i * alpha + l_ij
+        m_i = m_ij
+
+    inv_l = tl.where(l_i > 0, 1.0 / l_i, 0.0)
+    out_base_offsets = (
+        (cur_batch_start + offs_m[:, None]) * stride_obs + cur_head * stride_oh
+    )
+
+    tl.store(
+        Out + out_base_offsets + offs_d0[None, :],
+        acc_0 * inv_l[:, None],
+        mask=q_valid[:, None],
+    )
+    if CHUNK_1 > 0:
+        tl.store(
+            Out + out_base_offsets + offs_d1[None, :],
+            acc_1 * inv_l[:, None],
+            mask=q_valid[:, None],
+        )
+    if CHUNK_2 > 0:
+        tl.store(
+            Out + out_base_offsets + offs_d2[None, :],
+            acc_2 * inv_l[:, None],
+            mask=q_valid[:, None],
+        )
+    if CHUNK_3 > 0:
+        tl.store(
+            Out + out_base_offsets + offs_d3[None, :],
+            acc_3 * inv_l[:, None],
+            mask=q_valid[:, None],
+        )
+
+
+def _get_query_block_size(head_dim: int, dtype: torch.dtype) -> int:
+    if _uses_splitd_kernel(head_dim):
+        return 4 if head_dim > 128 else 8
+    if head_dim > 128:
+        return 8
     return 8 if dtype == torch.float32 else 16
 
 
-def _get_key_block_size(dtype: torch.dtype) -> int:
+def _get_key_block_size(head_dim: int, dtype: torch.dtype) -> int:
+    if _uses_splitd_kernel(head_dim):
+        return 32 if head_dim > 128 else 16
+    if head_dim > 128:
+        return 32
     if dtype == torch.float32:
         return 32
     if current_platform.is_cuda_alike() and current_platform.has_device_capability(80):
         return 64
     return 32
+
+
+def _get_num_warps(head_dim: int) -> int:
+    if _uses_splitd_kernel(head_dim):
+        return 2 if head_dim > 128 else 4
+    if head_dim > 128:
+        return 8
+    return 4 if head_dim <= 64 else 8
+
+
+def _is_power_of_2(value: int) -> bool:
+    return value > 0 and (value & (value - 1)) == 0
+
+
+def _uses_splitd_kernel(head_dim: int) -> bool:
+    return head_dim % 16 == 0 and not _is_power_of_2(head_dim)
+
+
+def _get_head_dim_chunks(head_dim: int) -> tuple[int, int, int, int]:
+    remaining = head_dim
+    chunks: list[int] = []
+    for chunk_size in (128, 64, 32, 16):
+        while remaining >= chunk_size:
+            chunks.append(chunk_size)
+            remaining -= chunk_size
+    if remaining != 0 or not chunks or len(chunks) > 4:
+        raise ValueError(
+            "cohere_asr_triton_relpos_attention supports exact split-D kernels "
+            "only for head_dim values decomposable into at most four power-of-two "
+            "chunks in {16, 32, 64, 128}."
+        )
+    chunks.extend([0] * (4 - len(chunks)))
+    return tuple(chunks)
 
 
 def cohere_asr_triton_relpos_attention(
@@ -222,9 +566,9 @@ def cohere_asr_triton_relpos_attention(
     assert k.shape == q_u.shape
     assert v.shape == q_u.shape
     assert p.shape == (num_heads, 2 * q_len - 1, head_dim)
-    if head_dim < 16 or head_dim > 128:
+    if head_dim < 16 or head_dim > 256:
         raise ValueError(
-            "cohere_asr_triton_relpos_attention supports head_dim in [16, 128]."
+            "cohere_asr_triton_relpos_attention supports head_dim in [16, 256]."
         )
 
     q_u_flat = q_u.transpose(1, 2).contiguous().view(batch_size * q_len, num_heads, head_dim)
@@ -244,47 +588,87 @@ def cohere_asr_triton_relpos_attention(
         device=q_u.device,
     )
 
-    block_m = _get_query_block_size(q_u.dtype)
-    block_n = _get_key_block_size(q_u.dtype)
-    num_warps = 4 if head_dim <= 64 else 8
+    block_m = _get_query_block_size(head_dim, q_u.dtype)
+    block_n = _get_key_block_size(head_dim, q_u.dtype)
+    num_warps = _get_num_warps(head_dim)
     sm_scale = (1.0 / (head_dim**0.5)) * RCP_LN2
 
     grid = (batch_size, num_heads, triton.cdiv(q_len, block_m))
-    _cohere_asr_relpos_fwd_kernel[grid](
-        q_u_flat,
-        q_v_flat,
-        k_flat,
-        v_flat,
-        p,
-        attn_mask,
-        sm_scale,
-        q_len - 1,
-        p.size(1),
-        start_loc,
-        seq_lens,
-        out_flat,
-        q_u_flat.stride(0),
-        q_u_flat.stride(1),
-        k_flat.stride(0),
-        k_flat.stride(1),
-        v_flat.stride(0),
-        v_flat.stride(1),
-        p.stride(0),
-        p.stride(1),
-        0 if attn_mask is None else attn_mask.stride(0),
-        0 if attn_mask is None else attn_mask.stride(1),
-        0 if attn_mask is None else attn_mask.stride(2),
-        out_flat.stride(0),
-        out_flat.stride(1),
-        HAS_MASK=attn_mask is not None,
-        MASK_BATCH_BROADCAST=attn_mask is None or attn_mask.size(0) == 1,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_DMODEL=triton.next_power_of_2(head_dim),
-        HEAD_SIZE=head_dim,
-        num_warps=num_warps,
-        num_stages=1,
-    )
+    if not _uses_splitd_kernel(head_dim):
+        _cohere_asr_relpos_fwd_kernel[grid](
+            q_u_flat,
+            q_v_flat,
+            k_flat,
+            v_flat,
+            p,
+            attn_mask,
+            sm_scale,
+            q_len - 1,
+            p.size(1),
+            start_loc,
+            seq_lens,
+            out_flat,
+            q_u_flat.stride(0),
+            q_u_flat.stride(1),
+            k_flat.stride(0),
+            k_flat.stride(1),
+            v_flat.stride(0),
+            v_flat.stride(1),
+            p.stride(0),
+            p.stride(1),
+            0 if attn_mask is None else attn_mask.stride(0),
+            0 if attn_mask is None else attn_mask.stride(1),
+            0 if attn_mask is None else attn_mask.stride(2),
+            out_flat.stride(0),
+            out_flat.stride(1),
+            HAS_MASK=attn_mask is not None,
+            MASK_BATCH_BROADCAST=attn_mask is None or attn_mask.size(0) == 1,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_DMODEL=triton.next_power_of_2(head_dim),
+            HEAD_SIZE=head_dim,
+            num_warps=num_warps,
+            num_stages=1,
+        )
+    else:
+        chunk_0, chunk_1, chunk_2, chunk_3 = _get_head_dim_chunks(head_dim)
+        _cohere_asr_relpos_splitd_fwd_kernel[grid](
+            q_u_flat,
+            q_v_flat,
+            k_flat,
+            v_flat,
+            p,
+            attn_mask,
+            sm_scale,
+            q_len - 1,
+            p.size(1),
+            start_loc,
+            seq_lens,
+            out_flat,
+            q_u_flat.stride(0),
+            q_u_flat.stride(1),
+            k_flat.stride(0),
+            k_flat.stride(1),
+            v_flat.stride(0),
+            v_flat.stride(1),
+            p.stride(0),
+            p.stride(1),
+            0 if attn_mask is None else attn_mask.stride(0),
+            0 if attn_mask is None else attn_mask.stride(1),
+            0 if attn_mask is None else attn_mask.stride(2),
+            out_flat.stride(0),
+            out_flat.stride(1),
+            HAS_MASK=attn_mask is not None,
+            MASK_BATCH_BROADCAST=attn_mask is None or attn_mask.size(0) == 1,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            CHUNK_0=chunk_0,
+            CHUNK_1=chunk_1,
+            CHUNK_2=chunk_2,
+            CHUNK_3=chunk_3,
+            num_warps=num_warps,
+            num_stages=1,
+        )
 
     return out_flat.view(batch_size, q_len, num_heads, head_dim).transpose(1, 2)
 

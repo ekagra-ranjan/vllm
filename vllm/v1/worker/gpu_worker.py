@@ -723,6 +723,13 @@ class Worker(WorkerBase):
         """Get encoder timing stats from model runner."""
         return self.model_runner.get_encoder_timing_stats()
 
+    def get_asr_model_timing_stats(self) -> dict[str, dict[str, float | int]]:
+        model = self.model_runner.get_model()
+        getter = getattr(model, "get_and_reset_timing_stats", None)
+        if getter is None:
+            return {}
+        return getter()
+
     def annotate_profile(self, scheduler_output):
         # add trace annotation so that we can easily distinguish
         # context/generation request numbers in each iteration.

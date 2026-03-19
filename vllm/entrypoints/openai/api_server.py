@@ -93,6 +93,8 @@ async def build_async_engine_client(
 
     # Context manager to handle engine_client lifecycle
     # Ensures everything is shutdown and cleaned up on error/exit
+    if envs.VLLM_SERVER_DEV_MODE:
+        setattr(args, "enable_mm_processor_stats", True)
     engine_args = AsyncEngineArgs.from_cli_args(args)
     if client_config:
         engine_args._api_process_count = client_config.get("client_count", 1)

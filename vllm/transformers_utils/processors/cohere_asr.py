@@ -15,10 +15,27 @@ from transformers.feature_extraction_sequence_utils import (
 )
 from transformers.processing_utils import ProcessorMixin
 
+import vllm.envs as envs
+from vllm.utils.stage_timing import StageTimingRegistry
+
 logger = logging.getLogger(__name__)
 
 CONSTANT = 1e-5
 INF_VAL = 10000.0
+
+COHERE_ASR_PROCESSOR_TIMING_STATS = StageTimingRegistry()
+
+
+def get_and_reset_cohere_asr_processor_timing_stats() -> dict[str, dict[str, float | int]]:
+    return COHERE_ASR_PROCESSOR_TIMING_STATS.snapshot_and_reset()
+
+
+def _record_processor_stage(stage: str):
+    return COHERE_ASR_PROCESSOR_TIMING_STATS.record(stage)
+
+
+def _record_processor_observation(stage: str, value: float) -> None:
+    COHERE_ASR_PROCESSOR_TIMING_STATS.add(stage, value)
 
 
 class FilterbankFeatures(nn.Module):
@@ -177,8 +194,16 @@ class FilterbankFeatures(nn.Module):
 
         assert self.window is not None
         assert self.fb is not None
-        self.window = self.window.to(dtype=torch.bfloat16)
-        self.fb = self.fb.to(dtype=torch.bfloat16)
+        self.register_buffer(
+            "window_float",
+            self.window.to(dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "fb_float",
+            self.fb.to(dtype=torch.float32),
+            persistent=False,
+        )
 
         self.generator = torch.Generator(device=device)
         self.generator.manual_seed(0)
@@ -193,7 +218,7 @@ class FilterbankFeatures(nn.Module):
                 hop_length=self.hop_length,
                 win_length=self.win_length,
                 center=not self.exact_pad,
-                window=self.window.to(dtype=torch.float, device=x.device),
+                window=self.window_float.to(device=x.device),
                 return_complex=True,
                 pad_mode="constant",
             )
@@ -344,7 +369,7 @@ class FilterbankFeatures(nn.Module):
 
         # use dither for inference as well
         if self.dither > 0:
-            x += self.dither * torch.randn(
+            x = x + self.dither * torch.randn(
                 x.shape, dtype=x.dtype, device=x.device, generator=self.generator
             )
 
@@ -353,23 +378,24 @@ class FilterbankFeatures(nn.Module):
             timemask = torch.arange(x.shape[1], device=x.device).unsqueeze(
                 0
             ) < seq_len_time.unsqueeze(1)
-            x = torch.cat(
-                (x[:, 0].unsqueeze(1), x[:, 1:] - self.preemph * x[:, :-1]), dim=1
-            )
-
-            x = x.masked_fill(~timemask, 0.0)
+            x = torch.cat((x[:, :1], x[:, 1:] - self.preemph * x[:, :-1]), dim=1)
+            x.masked_fill_(~timemask, 0.0)
 
         x = self.stft(x)
 
         # torch stft returns complex tensor (of shape [B,N,T]); so convert to magnitude
         # guard is needed for sqrt if grads are passed through
         guard = 0 if not self.use_grads else CONSTANT
-        x = torch.view_as_real(x)
-        x = torch.sqrt(x.pow(2).sum(-1) + guard)
+        x = x.abs()
+        if guard:
+            x = torch.sqrt(x.square() + guard)
 
         # get power spectrum
         if self.mag_power != 1.0:
-            x = x.pow(self.mag_power)
+            if self.mag_power == 2.0:
+                x = x.square()
+            else:
+                x = x.pow(self.mag_power)
 
         # return plain spectrogram if required
         if linear_spec:
@@ -379,14 +405,14 @@ class FilterbankFeatures(nn.Module):
         # on fp16 compatible GPUs and get NaN values for input value of 65520
         with torch.amp.autocast(x.device.type, enabled=False):
             # dot with filterbank energies
-            x = torch.matmul(self.fb.to(x.dtype), x)
+            x = torch.matmul(self.fb_float.to(device=x.device), x)
 
         # log features if required
         if self.log:
             if self.log_zero_guard_type == "add":
-                x = torch.log(x + self.log_zero_guard_value_fn(x))
+                x = x.add(self.log_zero_guard_value_fn(x)).log_()
             elif self.log_zero_guard_type == "clamp":
-                x = torch.log(torch.clamp(x, min=self.log_zero_guard_value_fn(x)))
+                x = x.clamp_min(self.log_zero_guard_value_fn(x)).log_()
             else:
                 raise ValueError("log_zero_guard_type was not understood")
 
@@ -401,13 +427,9 @@ class FilterbankFeatures(nn.Module):
         # mask to zero any values beyond seq_len in batch, pad to multiple of
         # `pad_to` (for efficiency)
         max_len = x.size(-1)
-        mask = torch.arange(max_len, device=x.device)
-        mask = mask.repeat(x.size(0), 1) >= seq_len.unsqueeze(1)
-        x = x.masked_fill(
-            mask.unsqueeze(1).type(torch.bool).to(device=x.device), self.pad_value
-        )
+        mask = torch.arange(max_len, device=x.device).unsqueeze(0) >= seq_len.unsqueeze(1)
+        x = x.masked_fill(mask.unsqueeze(1), self.pad_value)
 
-        del mask
         pad_to = self.pad_to
         if pad_to == "max":
             x = nn.functional.pad(
@@ -417,6 +439,109 @@ class FilterbankFeatures(nn.Module):
             pad_amt = x.size(-1) % pad_to
             if pad_amt != 0:
                 x = nn.functional.pad(x, (0, pad_to - pad_amt), value=self.pad_value)
+
+        return x, seq_len
+
+    def profiled_forward(self, x, seq_len, linear_spec=False):
+        if x.shape[1] < self.sample_rate * self.pad_min_duration:
+            pad_amount = int(self.sample_rate * self.pad_min_duration) - x.shape[1]
+            if self.pad_direction == "right":
+                x = F.pad(x, (0, pad_amount), value=self.pad_value)
+            elif self.pad_direction == "left":
+                x = F.pad(x, (pad_amount, 0), value=self.pad_value)
+            elif self.pad_direction == "both":
+                left_pad = pad_amount // 2
+                right_pad = pad_amount - left_pad
+                x = F.pad(x, (left_pad, right_pad), value=self.pad_value)
+            else:
+                raise ValueError(
+                    f"{self} received an invalid pad_direction: {self.pad_direction}. "
+                    f"It must be one of 'left', 'right', or 'both'."
+                )
+            seq_len = torch.tensor([x.shape[1]], dtype=torch.float, device=x.device)
+
+        seq_len_time = seq_len
+        seq_len_unfixed = self.get_seq_len(seq_len)
+        seq_len = torch.where(
+            seq_len == 0, torch.zeros_like(seq_len_unfixed), seq_len_unfixed
+        )
+
+        if self.stft_pad_amount is not None:
+            x = torch.nn.functional.pad(
+                x.unsqueeze(1), (self.stft_pad_amount, self.stft_pad_amount), "constant"
+            ).squeeze(1)
+
+        if self.dither > 0:
+            with _record_processor_stage("filterbank_dither_secs"):
+                x = x + self.dither * torch.randn(
+                    x.shape, dtype=x.dtype, device=x.device, generator=self.generator
+                )
+
+        if self.preemph is not None:
+            with _record_processor_stage("filterbank_preemph_secs"):
+                timemask = torch.arange(x.shape[1], device=x.device).unsqueeze(
+                    0
+                ) < seq_len_time.unsqueeze(1)
+                x = torch.cat(
+                    (x[:, :1], x[:, 1:] - self.preemph * x[:, :-1]), dim=1
+                )
+                x.masked_fill_(~timemask, 0.0)
+
+        with _record_processor_stage("filterbank_stft_secs"):
+            x = self.stft(x)
+
+        with _record_processor_stage("filterbank_magnitude_secs"):
+            guard = 0 if not self.use_grads else CONSTANT
+            x = x.abs()
+            if guard:
+                x = torch.sqrt(x.square() + guard)
+
+        if self.mag_power != 1.0:
+            with _record_processor_stage("filterbank_power_secs"):
+                if self.mag_power == 2.0:
+                    x = x.square()
+                else:
+                    x = x.pow(self.mag_power)
+
+        if linear_spec:
+            return x, seq_len
+
+        with torch.amp.autocast(x.device.type, enabled=False):
+            with _record_processor_stage("filterbank_mel_secs"):
+                x = torch.matmul(self.fb_float.to(device=x.device), x)
+
+        if self.log:
+            with _record_processor_stage("filterbank_log_secs"):
+                if self.log_zero_guard_type == "add":
+                    x = x.add(self.log_zero_guard_value_fn(x)).log_()
+                elif self.log_zero_guard_type == "clamp":
+                    x = x.clamp_min(self.log_zero_guard_value_fn(x)).log_()
+                else:
+                    raise ValueError("log_zero_guard_type was not understood")
+
+        if self.frame_splicing > 1:
+            x = self.splice_frames(x, self.frame_splicing)
+
+        if self.normalize:
+            with _record_processor_stage("filterbank_normalize_secs"):
+                x, _, _ = self.normalize_batch(x, seq_len, normalize_type=self.normalize)
+
+        with _record_processor_stage("filterbank_mask_pad_secs"):
+            max_len = x.size(-1)
+            mask = torch.arange(max_len, device=x.device).unsqueeze(0) >= seq_len.unsqueeze(1)
+            x = x.masked_fill(mask.unsqueeze(1), self.pad_value)
+
+            pad_to = self.pad_to
+            if pad_to == "max":
+                x = nn.functional.pad(
+                    x, (0, self.max_length - x.size(-1)), value=self.pad_value
+                )
+            elif pad_to > 0:
+                pad_amt = x.size(-1) % pad_to
+                if pad_amt != 0:
+                    x = nn.functional.pad(
+                        x, (0, pad_to - pad_amt), value=self.pad_value
+                    )
 
         return x, seq_len
 
@@ -506,6 +631,62 @@ class CohereASRFeatureExtractor(SequenceFeatureExtractor):
     def get_seq_len(self, seq_len):
         return self.filterbank.get_seq_len(seq_len)
 
+    def extract_features(
+        self,
+        raw_speech,
+        *,
+        to_cpu: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        with COHERE_ASR_PROCESSOR_TIMING_STATS.record("feature_batch_prep_secs"):
+            if isinstance(raw_speech, np.ndarray):
+                raw_speech = [raw_speech]
+
+            seq_len = torch.tensor([s.shape[0] for s in raw_speech], dtype=torch.long)
+            batch_size = len(raw_speech)
+            raw_sample_total = int(seq_len.sum().item()) if batch_size > 0 else 0
+            max_len = max(s.shape[0] for s in raw_speech)
+            padded_sample_total = batch_size * max_len
+            pad_waste_ratio = (
+                float(padded_sample_total - raw_sample_total) / padded_sample_total
+                if padded_sample_total > 0
+                else 0.0
+            )
+
+            _record_processor_observation("feature_batch_size_items", float(batch_size))
+            _record_processor_observation(
+                "feature_batch_raw_samples", float(raw_sample_total)
+            )
+            _record_processor_observation(
+                "feature_batch_max_samples", float(max_len)
+            )
+            _record_processor_observation(
+                "feature_batch_pad_waste_ratio", pad_waste_ratio
+            )
+
+            padded = np.zeros((len(raw_speech), max_len), dtype=np.float32)
+            for i, s in enumerate(raw_speech):
+                padded[i, : s.shape[0]] = s
+
+        with COHERE_ASR_PROCESSOR_TIMING_STATS.record("feature_tensorize_secs"):
+            audio_tensor = torch.from_numpy(padded).to(self._device)
+            seq_len = seq_len.to(self._device)
+
+        with torch.no_grad():
+            with COHERE_ASR_PROCESSOR_TIMING_STATS.record("filterbank_forward_secs"):
+                if envs.VLLM_SERVER_DEV_MODE:
+                    input_features, length = self.filterbank.profiled_forward(
+                        audio_tensor, seq_len
+                    )
+                else:
+                    input_features, length = self.filterbank(audio_tensor, seq_len)
+
+        if to_cpu:
+            with COHERE_ASR_PROCESSOR_TIMING_STATS.record("feature_to_cpu_secs"):
+                input_features = input_features.cpu()
+                length = length.cpu()
+
+        return input_features, length
+
     def __call__(
         self,
         raw_speech,
@@ -513,27 +694,13 @@ class CohereASRFeatureExtractor(SequenceFeatureExtractor):
         return_tensors=None,
         **kwargs,
     ) -> BatchFeature:
-        if isinstance(raw_speech, np.ndarray):
-            raw_speech = [raw_speech]
-
-        seq_len = torch.tensor([s.shape[0] for s in raw_speech])
-
-        max_len = max(s.shape[0] for s in raw_speech)
-        padded = np.zeros((len(raw_speech), max_len), dtype=np.float32)
-        for i, s in enumerate(raw_speech):
-            padded[i, : s.shape[0]] = s
-
-        audio_tensor = torch.from_numpy(padded).to(self._device)
-        seq_len = seq_len.to(self._device)
-
-        with torch.no_grad():
-            input_features, length = self.filterbank(audio_tensor, seq_len)
-
-        result = BatchFeature(
-            {"input_features": input_features.cpu(), "length": length.cpu()}
-        )
+        input_features, length = self.extract_features(raw_speech, to_cpu=True)
+        result = BatchFeature({"input_features": input_features, "length": length})
         if return_tensors is not None:
-            result = result.convert_to_tensors(return_tensors)
+            with COHERE_ASR_PROCESSOR_TIMING_STATS.record(
+                "feature_return_tensors_secs"
+            ):
+                result = result.convert_to_tensors(return_tensors)
         return result
 
 

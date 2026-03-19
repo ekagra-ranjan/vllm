@@ -35,6 +35,7 @@ from vllm.utils.gc_utils import (
 )
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.network_utils import make_zmq_socket
+from vllm.utils.stage_timing import StageTimingRegistry
 from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -76,6 +77,12 @@ from vllm.v1.utils import compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
+
+ENGINE_CORE_TIMING_STATS = StageTimingRegistry()
+
+
+def get_and_reset_engine_core_timing_stats() -> dict[str, dict[str, float | int]]:
+    return ENGINE_CORE_TIMING_STATS.snapshot_and_reset()
 
 HANDSHAKE_TIMEOUT_MINS = 5
 
@@ -732,29 +739,38 @@ class EngineCore:
     ) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args, kwargs)
 
+    def get_asr_debug_timing_stats(self) -> dict[str, dict[str, dict[str, float | int]]]:
+        from vllm.v1.core.sched.scheduler import get_and_reset_scheduler_timing_stats
+
+        return {
+            "engine_core": get_and_reset_engine_core_timing_stats(),
+            "scheduler": get_and_reset_scheduler_timing_stats(),
+        }
+
     def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
         """Preprocess the request.
 
         This function could be directly used in input processing thread to allow
         request initialization running in parallel with Model forward
         """
-        # Note on thread safety: no race condition.
-        # `mm_receiver_cache` is reset at the end of LLMEngine init,
-        # and will only be accessed in the input processing thread afterwards.
-        if self.mm_receiver_cache is not None and request.mm_features:
-            request.mm_features = self.mm_receiver_cache.get_and_update_features(
-                request.mm_features
-            )
-
-        req = Request.from_engine_core_request(request, self.request_block_hasher)
-        if req.use_structured_output:
+        with ENGINE_CORE_TIMING_STATS.record("preprocess_add_request_secs"):
             # Note on thread safety: no race condition.
-            # `grammar_init` is only invoked in input processing thread. For
-            # `structured_output_manager`, each request is independent and
-            # grammar compilation is async. Scheduler always checks grammar
-            # compilation status before scheduling request.
-            self.structured_output_manager.grammar_init(req)
-        return req, request.current_wave
+            # `mm_receiver_cache` is reset at the end of LLMEngine init,
+            # and will only be accessed in the input processing thread afterwards.
+            if self.mm_receiver_cache is not None and request.mm_features:
+                request.mm_features = self.mm_receiver_cache.get_and_update_features(
+                    request.mm_features
+                )
+
+            req = Request.from_engine_core_request(request, self.request_block_hasher)
+            if req.use_structured_output:
+                # Note on thread safety: no race condition.
+                # `grammar_init` is only invoked in input processing thread. For
+                # `structured_output_manager`, each request is independent and
+                # grammar compilation is async. Scheduler always checks grammar
+                # compilation status before scheduling request.
+                self.structured_output_manager.grammar_init(req)
+            return req, request.current_wave
 
     def _eep_scale_up_before_kv_init(self):
         raise NotImplementedError
@@ -1398,7 +1414,10 @@ class EngineCoreProc(EngineCore):
                     # Deserialize the request data.
                     request: Any
                     if request_type == EngineCoreRequestType.ADD:
-                        req: EngineCoreRequest = add_request_decoder.decode(data_frames)
+                        with ENGINE_CORE_TIMING_STATS.record(
+                            "input_socket_decode_add_secs"
+                        ):
+                            req = add_request_decoder.decode(data_frames)
                         try:
                             request = self.preprocess_add_request(req)
                         except Exception:

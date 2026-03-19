@@ -32,6 +32,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
+from vllm.utils.stage_timing import StageTimingRegistry
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -62,6 +63,12 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+SCHEDULER_TIMING_STATS = StageTimingRegistry()
+
+
+def get_and_reset_scheduler_timing_stats() -> dict[str, dict[str, float | int]]:
+    return SCHEDULER_TIMING_STATS.snapshot_and_reset()
 
 
 class Scheduler(SchedulerInterface):
@@ -336,6 +343,7 @@ class Scheduler(SchedulerInterface):
         return num_new_tokens
 
     def schedule(self) -> SchedulerOutput:
+        schedule_start_time = time.perf_counter()
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -922,6 +930,9 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        SCHEDULER_TIMING_STATS.add(
+            "schedule_total_secs", time.perf_counter() - schedule_start_time
+        )
         return scheduler_output
 
     def _build_kv_connector_meta(

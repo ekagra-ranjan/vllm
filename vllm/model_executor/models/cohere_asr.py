@@ -2,6 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+import os
+import threading
+import time
+from contextlib import contextmanager
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Literal, cast
 
@@ -9,8 +13,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import BatchFeature, PretrainedConfig
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, SpeechToTextConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -38,6 +43,7 @@ from vllm.multimodal.inputs import (
 )
 from vllm.multimodal.parse import (
     AudioProcessorItems,
+    ModalityDataItems,
     MultiModalDataItems,
     MultiModalDataParser,
 )
@@ -50,10 +56,12 @@ from vllm.multimodal.processing import (
 )
 from vllm.platforms import current_platform
 from vllm.renderers import TokenizeParams
+from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.transformers_utils.processors.cohere_asr import (
     CohereASRFeatureExtractor,
     CohereASRProcessor,
 )
+from vllm.utils.stage_timing import StageTimingRegistry
 from vllm.v1.attention.ops.cohere_asr_relpos_attention import (
     cohere_asr_triton_relpos_attention_wrapper,
 )
@@ -69,6 +77,195 @@ from .interfaces import (
 from .utils import AutoWeightsLoader, WeightsMapper, make_layers
 
 logger = init_logger(__name__)
+
+COHERE_ASR_MODEL_TIMING_STATS = StageTimingRegistry()
+COHERE_ASR_ENCODER_ATTENTION_MODE_ENV = (
+    "VLLM_COHERE_ASR_ENCODER_ATTENTION_MODE"
+)
+_COHERE_ASR_VALID_ATTENTION_MODES = {"triton", "sdpa", "manual"}
+_DEFAULT_COHERE_ASR_PREPROCESS_THREADS = 8
+
+
+def get_and_reset_cohere_asr_model_timing_stats() -> dict[str, dict[str, float | int]]:
+    return COHERE_ASR_MODEL_TIMING_STATS.snapshot_and_reset()
+
+
+def _record_model_observation(stage: str, value: float) -> None:
+    COHERE_ASR_MODEL_TIMING_STATS.add(stage, value)
+
+
+def _record_encoder_pad_efficiency(
+    stage: str,
+    lengths: torch.Tensor,
+    max_length: int,
+) -> None:
+    if not envs.VLLM_SERVER_DEV_MODE:
+        return
+    if max_length <= 0 or lengths.numel() == 0:
+        return
+
+    live_tokens = int(lengths.sum().item())
+    padded_tokens = int(lengths.numel()) * max_length
+    if padded_tokens <= 0:
+        return
+
+    _record_model_observation(stage, float(live_tokens) / padded_tokens)
+
+
+def _get_cohere_asr_encoder_attention_mode() -> str:
+    mode = os.getenv(COHERE_ASR_ENCODER_ATTENTION_MODE_ENV, "sdpa").strip().lower()
+    if mode in _COHERE_ASR_VALID_ATTENTION_MODES:
+        return mode
+
+    logger.warning_once(
+        "Ignoring invalid %s=%r; defaulting to 'sdpa'.",
+        COHERE_ASR_ENCODER_ATTENTION_MODE_ENV,
+        mode,
+    )
+    return "sdpa"
+
+
+def _create_cohere_asr_feature_extractor(
+    model_config: ModelConfig,
+) -> CohereASRFeatureExtractor:
+    hf_config = model_config.hf_config
+    preproc = hf_config.preprocessor
+
+    sample_rate = preproc.get("sample_rate", 16000)
+    window_size = preproc.get("window_size", 0.02)
+    window_stride = preproc.get("window_stride", 0.01)
+
+    return CohereASRFeatureExtractor(
+        feature_size=preproc.get("features", 64),
+        sampling_rate=sample_rate,
+        padding_value=preproc.get("pad_value", 0.0),
+        max_duration=hf_config.max_audio_clip_s,
+        n_window_size=int(window_size * sample_rate),
+        n_window_stride=int(window_stride * sample_rate),
+        window=preproc.get("window", "hann"),
+        normalize=preproc.get("normalize", "per_feature"),
+        n_fft=preproc.get("n_fft", None),
+        preemph=preproc.get("preemph", 0.97),
+        lowfreq=preproc.get("lowfreq", 0),
+        highfreq=preproc.get("highfreq", None),
+        log=preproc.get("log", True),
+        log_zero_guard_type=preproc.get("log_zero_guard_type", "add"),
+        log_zero_guard_value=preproc.get("log_zero_guard_value", 2**-24),
+        dither=preproc.get("dither", 1e-05),
+        pad_to=preproc.get("pad_to", 16),
+        frame_splicing=preproc.get("frame_splicing", 1),
+        exact_pad=preproc.get("exact_pad", False),
+        mag_power=preproc.get("mag_power", 2.0),
+        mel_norm=preproc.get("mel_norm", "slaney"),
+        stft_exact_pad=preproc.get("stft_exact_pad", False),
+        stft_conv=preproc.get("stft_conv", False),
+        device="cpu",
+    )
+
+
+def _cohere_asr_field_config(_hf_inputs: Mapping[str, torch.Tensor]):
+    return dict(
+        input_features=MultiModalFieldConfig.batched("audio"),
+        length=MultiModalFieldConfig.batched("audio"),
+    )
+
+
+class CohereASRPreprocessedAudioItems(
+    ModalityDataItems[Mapping[str, torch.Tensor], Mapping[str, torch.Tensor]]
+):
+    required_fields = {"input_features", "length", "num_audio_tokens"}
+
+    def __init__(self, data: Mapping[str, torch.Tensor]) -> None:
+        super().__init__(data, "audio")
+
+        missing_required_data_keys = self.required_fields - data.keys()
+        if missing_required_data_keys:
+            data_keys = set(data.keys())
+            raise ValueError(
+                f"The data should contain the fields: {self.required_fields}, "
+                f"but only found the following keys: {data_keys}"
+            )
+
+        from transformers.feature_extraction_utils import BatchFeature
+
+        self._kwargs = MultiModalKwargsItems.from_hf_inputs(
+            BatchFeature(
+                {
+                    "input_features": data["input_features"],
+                    "length": data["length"],
+                }
+            ),
+            _cohere_asr_field_config(data),
+        )
+
+    def get_count(self) -> int:
+        return len(self._kwargs[self.modality])
+
+    def get(self, index: int) -> Mapping[str, torch.Tensor]:
+        return self._kwargs[self.modality][index].get_data()
+
+    def get_processor_data(self) -> Mapping[str, object]:
+        return {}
+
+    def get_passthrough_data(self) -> Mapping[str, object]:
+        return {}
+
+    def get_num_audio_tokens(self, index: int) -> int:
+        return int(self.data["num_audio_tokens"][index].item())
+
+
+class CohereASRMultiModalDataParser(MultiModalDataParser):
+    def _parse_audio_data(
+        self,
+        data,
+    ) -> ModalityDataItems[object, object] | None:
+        if isinstance(data, dict) and CohereASRPreprocessedAudioItems.required_fields.issubset(
+            data.keys()
+        ):
+            return CohereASRPreprocessedAudioItems(cast(Mapping[str, torch.Tensor], data))
+
+        return super()._parse_audio_data(data)
+
+
+@contextmanager
+def _record_model_stage(
+    stage: str,
+    *,
+    use_device_timing: bool,
+):
+    should_sync = use_device_timing and envs.VLLM_SERVER_DEV_MODE and torch.cuda.is_available()
+    if should_sync:
+        try:
+            should_sync = not torch.cuda.is_current_stream_capturing()
+        except RuntimeError:
+            should_sync = False
+    if should_sync:
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            torch.cuda.synchronize()
+            COHERE_ASR_MODEL_TIMING_STATS.add(stage, time.perf_counter() - start)
+        return
+
+    with COHERE_ASR_MODEL_TIMING_STATS.record(stage):
+        yield
+
+
+@contextmanager
+def _record_encoder_hotspot_stage(
+    stage: str,
+    *,
+    use_device_timing: bool,
+):
+    if not envs.VLLM_SERVER_DEV_MODE:
+        yield
+        return
+
+    with _record_model_stage(stage, use_device_timing=use_device_timing):
+        yield
+
 
 # From https://platform.openai.com/docs/guides/speech-to-text/supported-languages
 
@@ -671,11 +868,19 @@ class ConvSubsampling(nn.Module):
     def forward(
         self, x: torch.Tensor, lengths: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        x, lengths = self.conv(x, lengths)
+        with _record_encoder_hotspot_stage(
+            "encoder_subsampling_conv_secs",
+            use_device_timing=x.is_cuda,
+        ):
+            x, lengths = self.conv(x, lengths)
 
         if self.conv2d_subsampling:
             b, c, t, f = x.size()
-            x = self.out(x.transpose(1, 2).reshape(b, t, -1))
+            with _record_encoder_hotspot_stage(
+                "encoder_subsampling_out_proj_secs",
+                use_device_timing=x.is_cuda,
+            ):
+                x = self.out(x.transpose(1, 2).reshape(b, t, -1))
         # Transpose to Channel Last mode
         else:
             x = x.transpose(1, 2)
@@ -1023,14 +1228,22 @@ class CohereASRMultiHeadAttention(nn.Module):
             raise ValueError(
                 "CohereASR encoder attention only supports self-attention inputs."
             )
-        qkv, _ = self.qkv_proj(query)
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(n_batch, -1, self.h, self.d_k)
-        k = k.view(n_batch, -1, self.h, self.d_k)
-        v = v.view(n_batch, -1, self.h, self.d_k)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        with _record_encoder_hotspot_stage(
+            "encoder_attention_qkv_proj_secs",
+            use_device_timing=query.is_cuda,
+        ):
+            qkv, _ = self.qkv_proj(query)
+        with _record_encoder_hotspot_stage(
+            "encoder_attention_qkv_layout_secs",
+            use_device_timing=query.is_cuda,
+        ):
+            q, k, v = qkv.chunk(3, dim=-1)
+            q = q.view(n_batch, -1, self.h, self.d_k)
+            k = k.view(n_batch, -1, self.h, self.d_k)
+            v = v.view(n_batch, -1, self.h, self.d_k)
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
 
         return q, k, v
 
@@ -1059,56 +1272,70 @@ class CohereASRMultiHeadAttention(nn.Module):
                 (batch, time2, d_model) weighted by the
                 attention scores
         """
-        scale = 1.0 / self.s_d_k
-        sdpa_mask: torch.Tensor | None = None
+        with _record_encoder_hotspot_stage(
+            "encoder_attention_core_secs",
+            use_device_timing=query.is_cuda,
+        ):
+            scale = 1.0 / self.s_d_k
+            sdpa_mask: torch.Tensor | None = None
 
-        if attn_bias is not None:
-            sdpa_mask = (attn_bias * scale).to(query.dtype)
-            mask_value = torch.finfo(sdpa_mask.dtype).min
-            if mask is not None:
-                sdpa_mask = sdpa_mask.masked_fill(mask.unsqueeze(1), mask_value)
-            if pad_mask is not None:
-                sdpa_mask = sdpa_mask.masked_fill(
-                    pad_mask[:, None, None, :], mask_value
-                )
-        else:
-            if mask is not None:
-                sdpa_mask = (~mask).unsqueeze(1)
-            if pad_mask is not None:
-                key_mask = (~pad_mask)[:, None, None, :]
-                sdpa_mask = key_mask if sdpa_mask is None else sdpa_mask & key_mask
+            if attn_bias is not None:
+                sdpa_mask = (attn_bias * scale).to(query.dtype)
+                mask_value = torch.finfo(sdpa_mask.dtype).min
+                if mask is not None:
+                    sdpa_mask = sdpa_mask.masked_fill(mask.unsqueeze(1), mask_value)
+                if pad_mask is not None:
+                    sdpa_mask = sdpa_mask.masked_fill(
+                        pad_mask[:, None, None, :], mask_value
+                    )
+            else:
+                if mask is not None:
+                    sdpa_mask = (~mask).unsqueeze(1)
+                if pad_mask is not None:
+                    key_mask = (~pad_mask)[:, None, None, :]
+                    sdpa_mask = (
+                        key_mask if sdpa_mask is None else sdpa_mask & key_mask
+                    )
 
-        x = F.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            attn_mask=sdpa_mask,
-            dropout_p=0.0,
-            is_causal=False,
-            scale=scale,
-        )
-
-        fully_masked_queries: torch.Tensor | None = None
-        if mask is not None:
-            fully_masked_queries = mask.all(dim=-1)
-            if fully_masked_queries.size(0) == 1 and x.size(0) > 1:
-                fully_masked_queries = fully_masked_queries.expand(x.size(0), -1)
-        if pad_mask is not None:
-            fully_masked_queries = (
-                pad_mask
-                if fully_masked_queries is None
-                else fully_masked_queries | pad_mask
+            x = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=sdpa_mask,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=scale,
             )
-        if fully_masked_queries is not None:
-            x = x.masked_fill(fully_masked_queries[:, None, :, None], 0.0)
+
+            fully_masked_queries: torch.Tensor | None = None
+            if mask is not None:
+                fully_masked_queries = mask.all(dim=-1)
+                if fully_masked_queries.size(0) == 1 and x.size(0) > 1:
+                    fully_masked_queries = fully_masked_queries.expand(x.size(0), -1)
+            if pad_mask is not None:
+                fully_masked_queries = (
+                    pad_mask
+                    if fully_masked_queries is None
+                    else fully_masked_queries | pad_mask
+                )
+            if fully_masked_queries is not None:
+                x = x.masked_fill(fully_masked_queries[:, None, :, None], 0.0)
 
         return self._project_attention_output(x)
 
     def _project_attention_output(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.transpose(1, 2).reshape(
-            x.size(0), -1, self.h * self.d_k
-        )  # (batch, time1, d_model)
-        return self.linear_out(x)  # (batch, time1, d_model)
+        with _record_encoder_hotspot_stage(
+            "encoder_attention_output_layout_secs",
+            use_device_timing=x.is_cuda,
+        ):
+            x = x.transpose(1, 2).reshape(
+                x.size(0), -1, self.h * self.d_k
+            )  # (batch, time1, d_model)
+        with _record_encoder_hotspot_stage(
+            "encoder_attention_out_proj_secs",
+            use_device_timing=x.is_cuda,
+        ):
+            return self.linear_out(x)  # (batch, time1, d_model)
 
     def forward(
         self,
@@ -1203,7 +1430,7 @@ class RelPositionMultiHeadAttention(CohereASRMultiHeadAttention):
             return False
         if query.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             return False
-        if self.d_k < 16 or self.d_k > 128 or pos_emb.size(0) != 1:
+        if self.d_k < 16 or self.d_k > 256 or pos_emb.size(0) != 1:
             return False
         if mask is not None and (
             mask.dtype != torch.bool or mask.size(0) not in (1, query.size(0))
@@ -1212,6 +1439,43 @@ class RelPositionMultiHeadAttention(CohereASRMultiHeadAttention):
         if pad_mask is not None and pad_mask.dtype != torch.bool:
             return False
         return True
+
+    def _forward_manual_relpos_attention(
+        self,
+        q_with_bias_u: torch.Tensor,
+        q_with_bias_v: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        p: torch.Tensor,
+        mask: torch.Tensor | None,
+        pad_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        scores = torch.matmul(q_with_bias_u, k.transpose(-2, -1))
+        matrix_bd = torch.matmul(q_with_bias_v, p.transpose(-2, -1))
+        matrix_bd = self.rel_shift(matrix_bd)
+        matrix_bd = matrix_bd[:, :, :, : k.size(-2)]
+        scores = (scores + matrix_bd) / self.s_d_k
+
+        combined_mask: torch.Tensor | None = mask
+        if pad_mask is not None:
+            key_mask = pad_mask[:, None, :]
+            query_mask = pad_mask[:, :, None]
+            combined_mask = (
+                key_mask | query_mask
+                if combined_mask is None
+                else combined_mask | key_mask | query_mask
+            )
+
+        if combined_mask is not None:
+            combined_mask = combined_mask.unsqueeze(1)
+            mask_value = torch.finfo(scores.dtype).min
+            scores = scores.masked_fill(combined_mask, mask_value)
+            probs = torch.softmax(scores, dim=-1).masked_fill(combined_mask, 0.0)
+        else:
+            probs = torch.softmax(scores, dim=-1)
+
+        x = torch.matmul(probs, v)
+        return self._project_attention_output(x)
 
     def _forward_triton_relpos_attention(
         self,
@@ -1288,13 +1552,32 @@ class RelPositionMultiHeadAttention(CohereASRMultiHeadAttention):
         q, k, v = self.forward_qkv(query, key, value)
         assert pos_emb is not None
         n_batch_pos = pos_emb.size(0)
-        p = self.linear_pos(pos_emb).view(n_batch_pos, -1, self.h, self.d_k)
+        with _record_encoder_hotspot_stage(
+            "encoder_attention_pos_proj_secs",
+            use_device_timing=pos_emb.is_cuda,
+        ):
+            p = self.linear_pos(pos_emb).view(n_batch_pos, -1, self.h, self.d_k)
         p = p.transpose(1, 2)  # (batch, head, time1, d_k)
 
         q_with_bias_u = q + self.pos_bias_u.unsqueeze(0).unsqueeze(2)
         q_with_bias_v = q + self.pos_bias_v.unsqueeze(0).unsqueeze(2)
 
-        if self._can_use_triton_relpos_attention(query, pos_emb, mask, pad_mask):
+        attention_mode = _get_cohere_asr_encoder_attention_mode()
+        if attention_mode == "manual":
+            return self._forward_manual_relpos_attention(
+                q_with_bias_u,
+                q_with_bias_v,
+                k,
+                v,
+                p,
+                mask,
+                pad_mask,
+            )
+
+        if (
+            attention_mode == "triton"
+            and self._can_use_triton_relpos_attention(query, pos_emb, mask, pad_mask)
+        ):
             return self._forward_triton_relpos_attention(
                 q_with_bias_u,
                 q_with_bias_v,
@@ -1305,13 +1588,17 @@ class RelPositionMultiHeadAttention(CohereASRMultiHeadAttention):
                 pad_mask,
             )
 
-        # compute matrix b and matrix d
-        # (batch, head, time1, time2)
-        matrix_bd = torch.matmul(q_with_bias_v, p.transpose(-2, -1))
-        matrix_bd = self.rel_shift(matrix_bd)
+        with _record_encoder_hotspot_stage(
+            "encoder_attention_relpos_bias_secs",
+            use_device_timing=q_with_bias_u.is_cuda,
+        ):
+            # compute matrix b and matrix d
+            # (batch, head, time1, time2)
+            matrix_bd = torch.matmul(q_with_bias_v, p.transpose(-2, -1))
+            matrix_bd = self.rel_shift(matrix_bd)
 
-        # Drop extra relative positions to match the key sequence length.
-        matrix_bd = matrix_bd[:, :, :, : k.size(-2)]
+            # Drop extra relative positions to match the key sequence length.
+            matrix_bd = matrix_bd[:, :, :, : k.size(-2)]
         return self.forward_attention(
             q_with_bias_u,
             k,
@@ -1418,11 +1705,27 @@ class ConformerLayer(torch.nn.Module):
             x (torch.Tensor): (B, T, d_model)
         """
         residual = x
-        x = self.norm_feed_forward1(x)
-        x = self.feed_forward1(x)
-        residual = residual + x * self.fc_factor
+        with _record_encoder_hotspot_stage(
+            "encoder_layernorm_secs",
+            use_device_timing=x.is_cuda,
+        ):
+            x = self.norm_feed_forward1(x)
+        with _record_encoder_hotspot_stage(
+            "encoder_ffn1_secs",
+            use_device_timing=x.is_cuda,
+        ):
+            x = self.feed_forward1(x)
+        with _record_encoder_hotspot_stage(
+            "encoder_residual_add_secs",
+            use_device_timing=x.is_cuda,
+        ):
+            residual = residual + x * self.fc_factor
 
-        x = self.norm_self_att(residual)
+        with _record_encoder_hotspot_stage(
+            "encoder_layernorm_secs",
+            use_device_timing=residual.is_cuda,
+        ):
+            x = self.norm_self_att(residual)
         if self.self_attention_model == "rel_pos":
             x = self.self_attn(
                 query=x,
@@ -1451,17 +1754,49 @@ class ConformerLayer(torch.nn.Module):
         else:
             x = None
 
-        residual = residual + x
+        with _record_encoder_hotspot_stage(
+            "encoder_residual_add_secs",
+            use_device_timing=residual.is_cuda,
+        ):
+            residual = residual + x
 
-        x = self.norm_conv(residual)
-        x = self.conv(x, pad_mask=pad_mask)
-        residual = residual + x
+        with _record_encoder_hotspot_stage(
+            "encoder_layernorm_secs",
+            use_device_timing=residual.is_cuda,
+        ):
+            x = self.norm_conv(residual)
+        with _record_encoder_hotspot_stage(
+            "encoder_conformer_conv_secs",
+            use_device_timing=x.is_cuda,
+        ):
+            x = self.conv(x, pad_mask=pad_mask)
+        with _record_encoder_hotspot_stage(
+            "encoder_residual_add_secs",
+            use_device_timing=residual.is_cuda,
+        ):
+            residual = residual + x
 
-        x = self.norm_feed_forward2(residual)
-        x = self.feed_forward2(x)
-        residual = residual + x * self.fc_factor
+        with _record_encoder_hotspot_stage(
+            "encoder_layernorm_secs",
+            use_device_timing=residual.is_cuda,
+        ):
+            x = self.norm_feed_forward2(residual)
+        with _record_encoder_hotspot_stage(
+            "encoder_ffn2_secs",
+            use_device_timing=x.is_cuda,
+        ):
+            x = self.feed_forward2(x)
+        with _record_encoder_hotspot_stage(
+            "encoder_residual_add_secs",
+            use_device_timing=x.is_cuda,
+        ):
+            residual = residual + x * self.fc_factor
 
-        x = self.norm_out(residual)
+        with _record_encoder_hotspot_stage(
+            "encoder_layernorm_secs",
+            use_device_timing=residual.is_cuda,
+        ):
+            x = self.norm_out(residual)
 
         return x
 
@@ -1651,24 +1986,50 @@ class ConformerEncoder(nn.Module):
             )
 
         cur_att_context_size = self.att_context_size
-        audio_signal = torch.transpose(audio_signal, 1, 2)
+        _record_encoder_pad_efficiency(
+            "encoder_input_pad_efficiency",
+            length,
+            audio_signal.size(-1),
+        )
+        with _record_encoder_hotspot_stage(
+            "encoder_input_layout_secs",
+            use_device_timing=audio_signal.is_cuda,
+        ):
+            audio_signal = torch.transpose(audio_signal, 1, 2)
 
-        audio_signal, length = self.pre_encode(x=audio_signal, lengths=length)
+        with _record_encoder_hotspot_stage(
+            "encoder_pre_encode_secs",
+            use_device_timing=audio_signal.is_cuda,
+        ):
+            audio_signal, length = self.pre_encode(x=audio_signal, lengths=length)
         length = length.to(torch.int64)
+        _record_encoder_pad_efficiency(
+            "encoder_subsampled_pad_efficiency",
+            length,
+            audio_signal.size(1),
+        )
 
         max_audio_length = audio_signal.size(1)
 
         padding_length = length
 
-        audio_signal, pos_emb = self.pos_enc(x=audio_signal, cache_len=0)
+        with _record_encoder_hotspot_stage(
+            "encoder_positional_encoding_secs",
+            use_device_timing=audio_signal.is_cuda,
+        ):
+            audio_signal, pos_emb = self.pos_enc(x=audio_signal, cache_len=0)
 
-        pad_mask, att_mask = self._create_masks(
-            att_context_size=cur_att_context_size,
-            padding_length=padding_length,
-            max_audio_length=max_audio_length,
-            offset=None,
-            device=audio_signal.device,
-        )
+        with _record_encoder_hotspot_stage(
+            "encoder_mask_setup_secs",
+            use_device_timing=audio_signal.is_cuda,
+        ):
+            pad_mask, att_mask = self._create_masks(
+                att_context_size=cur_att_context_size,
+                padding_length=padding_length,
+                max_audio_length=max_audio_length,
+                offset=None,
+                device=audio_signal.device,
+            )
 
         for lth, layer in enumerate(self.layers):
             audio_signal = layer(
@@ -1679,9 +2040,17 @@ class ConformerEncoder(nn.Module):
             )
 
         if self.out_proj is not None:
-            audio_signal = self.out_proj(audio_signal)
+            with _record_encoder_hotspot_stage(
+                "encoder_output_proj_secs",
+                use_device_timing=audio_signal.is_cuda,
+            ):
+                audio_signal = self.out_proj(audio_signal)
 
-        audio_signal = torch.transpose(audio_signal, 1, 2)
+        with _record_encoder_hotspot_stage(
+            "encoder_output_layout_secs",
+            use_device_timing=audio_signal.is_cuda,
+        ):
+            audio_signal = torch.transpose(audio_signal, 1, 2)
         length = length.to(dtype=torch.int64)
 
         return audio_signal, length
@@ -1862,12 +2231,24 @@ class CohereASRModel(nn.Module):
         positions: torch.Tensor,
         encoder_outputs: list[torch.Tensor],
     ) -> torch.Tensor:
-        enc_states = torch.cat(encoder_outputs, dim=0) if len(encoder_outputs) else None
-        decoder_outputs = self.decoder(
-            input_ids=input_ids,
-            positions=positions,
-            encoder_hidden_states=enc_states,
-        )
+        if len(encoder_outputs):
+            with _record_model_stage(
+                "concat_encoder_outputs_secs",
+                use_device_timing=encoder_outputs[0].is_cuda,
+            ):
+                enc_states = torch.cat(encoder_outputs, dim=0)
+        else:
+            enc_states = None
+
+        with _record_model_stage(
+            "decoder_forward_secs",
+            use_device_timing=positions.is_cuda,
+        ):
+            decoder_outputs = self.decoder(
+                input_ids=input_ids,
+                positions=positions,
+                encoder_hidden_states=enc_states,
+            )
 
         return decoder_outputs
 
@@ -1880,24 +2261,40 @@ class CohereASRModel(nn.Module):
             return None
 
         if isinstance(input_features, torch.Tensor):
+            total_start = time.perf_counter()
             encoder_input_length = seq_lens
-            out, encoder_output_length = self.encoder(
-                input_features, length=encoder_input_length
-            )  # B x D x T
+            with _record_model_stage(
+                "encoder_forward_batch_secs",
+                use_device_timing=input_features.is_cuda,
+            ):
+                out, encoder_output_length = self.encoder(
+                    input_features, length=encoder_input_length
+                )  # B x D x T
             out = out.permute(0, 2, 1)
 
             if hasattr(self, "encoder_decoder_proj"):
-                out = self.encoder_decoder_proj(out)
+                with _record_model_stage(
+                    "encoder_decoder_proj_secs",
+                    use_device_timing=out.is_cuda,
+                ):
+                    out = self.encoder_decoder_proj(out)
 
             # Convert padded tensor to packed
-            outs = []
-            for i, feat in enumerate(out):
-                feat_len = encoder_output_length[i]
-                outs.append(feat[:feat_len, :])
+            with COHERE_ASR_MODEL_TIMING_STATS.record("pack_encoder_outputs_secs"):
+                outs = []
+                for i, feat in enumerate(out):
+                    feat_len = encoder_output_length[i]
+                    outs.append(feat[:feat_len, :])
+            COHERE_ASR_MODEL_TIMING_STATS.add(
+                "get_encoder_outputs_total_secs", time.perf_counter() - total_start
+            )
 
             return outs
         else:
             raise NotImplementedError("List input_features not supported")
+
+    def get_and_reset_timing_stats(self) -> dict[str, dict[str, float | int]]:
+        return get_and_reset_cohere_asr_model_timing_stats()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
@@ -1964,38 +2361,8 @@ class CohereASRProcessingInfo(BaseProcessingInfo):
 
     def get_hf_processor(self, **kwargs: object) -> CohereASRProcessor:
         if not hasattr(self, "_cached_hf_processor"):
-            hf_config = self.get_hf_config()
-            preproc = hf_config.preprocessor
-
-            sample_rate = preproc.get("sample_rate", 16000)
-            window_size = preproc.get("window_size", 0.02)
-            window_stride = preproc.get("window_stride", 0.01)
-
-            feature_extractor = CohereASRFeatureExtractor(
-                feature_size=preproc.get("features", 64),
-                sampling_rate=sample_rate,
-                padding_value=preproc.get("pad_value", 0.0),
-                max_duration=hf_config.max_audio_clip_s,
-                n_window_size=int(window_size * sample_rate),
-                n_window_stride=int(window_stride * sample_rate),
-                window=preproc.get("window", "hann"),
-                normalize=preproc.get("normalize", "per_feature"),
-                n_fft=preproc.get("n_fft", None),
-                preemph=preproc.get("preemph", 0.97),
-                lowfreq=preproc.get("lowfreq", 0),
-                highfreq=preproc.get("highfreq", None),
-                log=preproc.get("log", True),
-                log_zero_guard_type=preproc.get("log_zero_guard_type", "add"),
-                log_zero_guard_value=preproc.get("log_zero_guard_value", 2**-24),
-                dither=preproc.get("dither", 1e-05),
-                pad_to=preproc.get("pad_to", 16),
-                frame_splicing=preproc.get("frame_splicing", 1),
-                exact_pad=preproc.get("exact_pad", False),
-                mag_power=preproc.get("mag_power", 2.0),
-                mel_norm=preproc.get("mel_norm", "slaney"),
-                stft_exact_pad=preproc.get("stft_exact_pad", False),
-                stft_conv=preproc.get("stft_conv", False),
-                device="cpu",
+            feature_extractor = _create_cohere_asr_feature_extractor(
+                self.ctx.model_config
             )
 
             tokenizer = self.ctx.tokenizer
@@ -2010,7 +2377,7 @@ class CohereASRProcessingInfo(BaseProcessingInfo):
 
     def get_data_parser(self) -> MultiModalDataParser:
         feature_extractor = self.get_feature_extractor()
-        return MultiModalDataParser(target_sr=feature_extractor.sampling_rate)
+        return CohereASRMultiModalDataParser(target_sr=feature_extractor.sampling_rate)
 
     def get_feature_extractor(self, **kwargs: object) -> CohereASRFeatureExtractor:
         hf_processor = self.get_hf_processor(**kwargs)
@@ -2020,10 +2387,12 @@ class CohereASRProcessingInfo(BaseProcessingInfo):
 
     def get_num_audio_tokens(self, num_samples: int) -> int:
         num_tokens = self.get_feature_extractor().get_seq_len(num_samples)
+        return self.get_num_audio_tokens_from_feature_length(num_tokens)
+
+    def get_num_audio_tokens_from_feature_length(self, feature_length: torch.Tensor | int) -> int:
         config = self.get_hf_config()
         subsampling_factor = config.encoder["subsampling_factor"]
-        num_tokens = math.ceil(num_tokens / subsampling_factor)
-        return num_tokens
+        return math.ceil(int(feature_length) / subsampling_factor)
 
 
 class CohereASRDummyInputsBuilder(BaseDummyInputsBuilder[CohereASRProcessingInfo]):
@@ -2064,6 +2433,85 @@ class CohereASRMultiModalProcessor(EncDecMultiModalProcessor[CohereASRProcessing
     ) -> str | list[int]:
         return [0]
 
+    def get_torch_num_threads(self, _inputs) -> int | None:
+        raw_value = os.getenv("VLLM_COHERE_ASR_PREPROCESS_THREADS")
+        if raw_value is None:
+            cpu_count = os.cpu_count() or _DEFAULT_COHERE_ASR_PREPROCESS_THREADS
+            return max(1, min(cpu_count, _DEFAULT_COHERE_ASR_PREPROCESS_THREADS))
+
+        try:
+            num_threads = int(raw_value)
+        except ValueError:
+            logger.warning_once(
+                "Ignoring invalid VLLM_COHERE_ASR_PREPROCESS_THREADS=%r.",
+                raw_value,
+            )
+            return None
+
+        if num_threads < 1:
+            logger.warning_once(
+                "Ignoring non-positive VLLM_COHERE_ASR_PREPROCESS_THREADS=%r.",
+                raw_value,
+            )
+            return None
+
+        return num_threads
+
+    def _apply_hf_processor_mm_only(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        if isinstance(mm_items.get("audio"), CohereASRPreprocessedAudioItems):
+            preprocessed_audios = mm_items.get_items(
+                "audio",
+                CohereASRPreprocessedAudioItems,
+            )
+            return BatchFeature(
+                {
+                    "input_features": preprocessed_audios.data["input_features"],
+                    "length": preprocessed_audios.data["length"],
+                }
+            )
+
+        if hf_processor_mm_kwargs:
+            return super()._apply_hf_processor_mm_only(
+                mm_items=mm_items,
+                hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+                tokenization_kwargs=tokenization_kwargs,
+            )
+
+        try:
+            audios = mm_items.get_items("audio", AudioProcessorItems)
+        except (KeyError, TypeError):
+            return super()._apply_hf_processor_mm_only(
+                mm_items=mm_items,
+                hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+                tokenization_kwargs=tokenization_kwargs,
+            )
+
+        raw_audios = [audios.get(i) for i in range(audios.get_count())]
+        if not raw_audios:
+            return BatchFeature()
+        if any(audio is None for audio in raw_audios):
+            return super()._apply_hf_processor_mm_only(
+                mm_items=mm_items,
+                hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+                tokenization_kwargs=tokenization_kwargs,
+            )
+
+        feature_extractor = self.info.get_feature_extractor()
+        input_features, length = feature_extractor.extract_features(
+            cast(list[np.ndarray], raw_audios),
+            to_cpu=True,
+        )
+        input_features = input_features.to(dtype=self.info.ctx.model_config.dtype)
+
+        return BatchFeature(
+            {"input_features": input_features, "length": length}
+        )
+
     def _call_hf_processor(
         self,
         prompt: str,
@@ -2093,10 +2541,7 @@ class CohereASRMultiModalProcessor(EncDecMultiModalProcessor[CohereASRProcessing
         hf_inputs,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
-        return dict(
-            input_features=MultiModalFieldConfig.batched("audio"),
-            length=MultiModalFieldConfig.batched("audio"),
-        )
+        return _cohere_asr_field_config(hf_inputs)
 
     def _get_prompt_updates(
         self,
@@ -2105,9 +2550,13 @@ class CohereASRMultiModalProcessor(EncDecMultiModalProcessor[CohereASRProcessing
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
         def get_audio_replacement_cohere_asr(item_idx: int):
-            audios = mm_items.get_items("audio", AudioProcessorItems)
-            audio_len = audios.get_audio_length(item_idx)
-            num_tokens = self.info.get_num_audio_tokens(num_samples=audio_len)
+            audio_items = mm_items["audio"]
+            if isinstance(audio_items, CohereASRPreprocessedAudioItems):
+                num_tokens = audio_items.get_num_audio_tokens(item_idx)
+            else:
+                audios = mm_items.get_items("audio", AudioProcessorItems)
+                audio_len = audios.get_audio_length(item_idx)
+                num_tokens = self.info.get_num_audio_tokens(num_samples=audio_len)
             return [0] * num_tokens
 
         return [
@@ -2127,6 +2576,11 @@ class CohereASRMultiModalProcessor(EncDecMultiModalProcessor[CohereASRProcessing
 class CohereASRForConditionalGeneration(
     nn.Module, SupportsTranscription, SupportsMultiModal
 ):
+    _default_prompt_token_ids_cache: dict[
+        tuple[object, ...], dict[str, tuple[int, ...]]
+    ] = {}
+    _default_prompt_token_ids_cache_lock = threading.Lock()
+
     packed_modules_mapping = {
         "self_attn.qkv_proj": [
             "self_attn.q_proj",
@@ -2162,10 +2616,113 @@ class CohereASRForConditionalGeneration(
         return super().validate_language(language)
 
     @classmethod
+    def _get_default_prompt_text(cls, language: str) -> str:
+        # NOTE: this function is used only by online inference and not offline inference
+        # CohereASR doesnt have encoder prompt
+        language_tag = f"<|{language}|><|{language}|>"
+        pnc = True  # TODO(ekagra): make this configurable later
+        pnc_tag = "<|pnc|>" if pnc else "<|nopnc|>"
+        return (
+            f"<|startofcontext|><|startoftranscript|>"
+            f"<|emo:undefined|>{language_tag}{pnc_tag}"
+            f"<|noitn|><|notimestamp|><|nodiarize|>"
+        )
+
+    @classmethod
+    def _get_prompt_cache_key(cls, model_config: ModelConfig) -> tuple[object, ...]:
+        return (
+            model_config.tokenizer,
+            model_config.runner_type,
+            model_config.tokenizer_mode,
+            model_config.tokenizer_revision,
+            model_config.trust_remote_code,
+        )
+
+    @classmethod
+    def _get_default_prompt_token_ids(
+        cls,
+        model_config: ModelConfig,
+        language: str,
+    ) -> list[int]:
+        cache_key = cls._get_prompt_cache_key(model_config)
+        with cls._default_prompt_token_ids_cache_lock:
+            token_cache = cls._default_prompt_token_ids_cache.get(cache_key)
+            if token_cache is None:
+                tokenizer = cached_tokenizer_from_config(model_config)
+                if tokenizer is None:
+                    raise ValueError("Tokenizer must be initialized for CohereASR")
+                token_cache = {
+                    lang: tuple(
+                        tokenizer.encode(
+                            cls._get_default_prompt_text(lang),
+                            add_special_tokens=False,
+                        )
+                    )
+                    for lang in cls.supported_languages
+                }
+                cls._default_prompt_token_ids_cache[cache_key] = token_cache
+
+            prompt_token_ids = token_cache.get(language)
+            if prompt_token_ids is None:
+                tokenizer = cached_tokenizer_from_config(model_config)
+                if tokenizer is None:
+                    raise ValueError("Tokenizer must be initialized for CohereASR")
+                prompt_token_ids = tuple(
+                    tokenizer.encode(
+                        cls._get_default_prompt_text(language),
+                        add_special_tokens=False,
+                    )
+                )
+                token_cache[language] = prompt_token_ids
+
+        return list(prompt_token_ids)
+
+    @classmethod
+    def warmup_prompt_token_cache(cls, model_config: ModelConfig) -> None:
+        # Prime the default prompt tokens once during server startup so the
+        # common transcription path doesn't enqueue tokenizer work later on.
+        cls._get_default_prompt_token_ids(
+            model_config,
+            next(iter(cls.supported_languages)),
+        )
+
+    @classmethod
+    def batch_preprocess_audio_chunks(
+        cls,
+        chunks: Sequence[np.ndarray],
+        model_config: ModelConfig,
+    ) -> list[dict[str, torch.Tensor]]:
+        feature_extractor = _create_cohere_asr_feature_extractor(model_config)
+        input_features, length = feature_extractor.extract_features(
+            list(chunks),
+            to_cpu=True,
+        )
+        input_features = input_features.to(dtype=model_config.dtype)
+
+        subsampling_factor = model_config.hf_config.encoder["subsampling_factor"]
+        num_audio_tokens = torch.ceil(
+            length.to(dtype=torch.float32) / subsampling_factor
+        ).to(dtype=torch.int64)
+
+        return [
+            {
+                # Keep each request's preprocessed tensor trimmed to its own
+                # feature length so cross-request microbatching does not pin
+                # every item to the longest clip in the microbatch.
+                "input_features": input_features[
+                    i : i + 1, :, : int(length[i].item())
+                ],
+                "length": length[i : i + 1],
+                "num_audio_tokens": num_audio_tokens[i : i + 1],
+            }
+            for i in range(len(chunks))
+        ]
+
+    @classmethod
     def get_generation_prompt(
         cls,
         audio: np.ndarray,
-        model_config: ModelConfig,  # not needed here
+        model_config: ModelConfig,
         stt_config: SpeechToTextConfig,
         language: str | None,
         task_type: Literal["transcribe", "translate"],
@@ -2177,23 +2734,18 @@ class CohereASRForConditionalGeneration(
                 "Language must be specified when creating the CohereASR prompt"
             )
 
-        # NOTE: this function is used only by online inference and not offline inference
-        # CohereASR doesnt have encoder prompt
-        language_tag = f"<|{language}|><|{language}|>"
-        pnc = True  # TODO(ekagra): make this configurable later
-        pnc_tag = "<|pnc|>" if pnc else "<|nopnc|>"
-        default_prompt = (
-            f"<|startofcontext|><|startoftranscript|>"
-            f"<|emo:undefined|>{language_tag}{pnc_tag}"
-            f"<|noitn|><|notimestamp|><|nodiarize|>"
-        )
-        prompt_text = request_prompt if request_prompt else default_prompt
+        prompt_text = request_prompt or cls._get_default_prompt_text(language)
         prompt = {
             "prompt": prompt_text,
             "multi_modal_data": {
                 "audio": (audio, stt_config.sample_rate),
             },
         }
+        if not request_prompt:
+            prompt["prompt_token_ids"] = cls._get_default_prompt_token_ids(
+                model_config,
+                language,
+            )
 
         return cast(PromptType, prompt)
 
@@ -2278,6 +2830,9 @@ class CohereASRForConditionalGeneration(
         # Required as part of SupportsMultiModal interface.
         return self.model.decoder
 
+    def get_and_reset_timing_stats(self) -> dict[str, dict[str, float | int]]:
+        return self.model.get_and_reset_timing_stats()
+
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         # Required as part of SupportsMultiModal interface.
         audio_input, seq_lens = self._parse_and_validate_audio_input(**kwargs)
@@ -2319,7 +2874,15 @@ class CohereASRForConditionalGeneration(
         return input_features, seq_lens
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        logits = self.logits_processor(self.proj_out, hidden_states, self.proj_out.bias)
+        with _record_model_stage(
+            "logits_forward_secs",
+            use_device_timing=hidden_states.is_cuda,
+        ):
+            logits = self.logits_processor(
+                self.proj_out,
+                hidden_states,
+                self.proj_out.bias,
+            )
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
