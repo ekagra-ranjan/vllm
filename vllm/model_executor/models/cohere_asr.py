@@ -86,6 +86,9 @@ ISO639_1_SUPPORTED_LANGS = {
     "zh": "Chinese",
 }
 
+import os
+_DEFAULT_COHERE_ASR_PREPROCESS_THREADS = 8
+
 
 class CohereASRAttention(nn.Module):
     def __init__(
@@ -1928,6 +1931,30 @@ class CohereASRMultiModalProcessor(EncDecMultiModalProcessor[CohereASRProcessing
         mm_items: MultiModalDataItems,
     ) -> str | list[int]:
         return [0]
+
+    def get_torch_num_threads(self, _inputs) -> int | None:
+        raw_value = os.getenv("VLLM_COHERE_ASR_PREPROCESS_THREADS")
+        if raw_value is None:
+            cpu_count = os.cpu_count() or _DEFAULT_COHERE_ASR_PREPROCESS_THREADS
+            return max(1, min(cpu_count, _DEFAULT_COHERE_ASR_PREPROCESS_THREADS))
+
+        try:
+            num_threads = int(raw_value)
+        except ValueError:
+            logger.warning_once(
+                "Ignoring invalid VLLM_COHERE_ASR_PREPROCESS_THREADS=%r.",
+                raw_value,
+            )
+            return None
+
+        if num_threads < 1:
+            logger.warning_once(
+                "Ignoring non-positive VLLM_COHERE_ASR_PREPROCESS_THREADS=%r.",
+                raw_value,
+            )
+            return None
+
+        return num_threads
 
     def _call_hf_processor(
         self,

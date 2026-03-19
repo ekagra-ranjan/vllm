@@ -1004,6 +1004,10 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
 
         return self.apply(processor_inputs, TimingContext(enabled=False))
 
+    def get_torch_num_threads(self, inputs: ProcessorInputs) -> int | None:
+        """Override to request a model-specific CPU thread count."""
+        return None
+
     @abstractmethod
     def _get_mm_fields_config(
         self,
