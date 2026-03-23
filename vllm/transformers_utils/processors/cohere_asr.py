@@ -506,13 +506,10 @@ class CohereASRFeatureExtractor(SequenceFeatureExtractor):
     def get_seq_len(self, seq_len):
         return self.filterbank.get_seq_len(seq_len)
 
-    def __call__(
-        self,
-        raw_speech,
-        sampling_rate=None,
-        return_tensors=None,
-        **kwargs,
-    ) -> BatchFeature:
+    def extract_features(self, raw_speech, *, to_cpu=True) -> tuple[torch.Tensor, torch.Tensor]:
+        # print(f"extract_features raw_speech len: {len(raw_speech)}")
+        # print(f"torch.get_num_threads(): {torch.get_num_threads()}")
+        
         if isinstance(raw_speech, np.ndarray):
             raw_speech = [raw_speech]
 
@@ -529,6 +526,23 @@ class CohereASRFeatureExtractor(SequenceFeatureExtractor):
         with torch.no_grad():
             input_features, length = self.filterbank(audio_tensor, seq_len)
 
+        if to_cpu:
+            input_features = input_features.cpu()
+            length = length.cpu()
+
+        return input_features, length
+
+    def __call__(
+        self,
+        raw_speech,
+        sampling_rate=None,
+        return_tensors=None,
+        **kwargs,
+    ) -> BatchFeature:
+        # REMOVE
+        # print(f"raw_speech len: {len(raw_speech)}")
+
+        input_features, length = self.extract_features(raw_speech, to_cpu=True)
         result = BatchFeature(
             {"input_features": input_features.cpu(), "length": length.cpu()}
         )

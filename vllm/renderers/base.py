@@ -623,6 +623,8 @@ class BaseRenderer(ABC, Generic[_T]):
         num_threads = mm_processor.get_torch_num_threads(mm_processor_inputs)
 
         with set_default_torch_num_threads(num_threads):
+            # REMOVE
+            # print(f"num_threads: {num_threads}")
             mm_inputs = mm_processor.apply(mm_processor_inputs, mm_timing_ctx)
 
         self.update_mm_cache_stats()

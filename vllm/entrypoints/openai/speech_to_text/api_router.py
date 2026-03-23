@@ -49,6 +49,18 @@ def translation(request: Request) -> OpenAIServingTranslation:
     return request.app.state.openai_serving_translation
 
 
+def speech_to_text_handler(request: Request) -> OpenAIServingTranscription | OpenAIServingTranslation:
+    handler = transcription(request)
+    if handler is not None:
+        return handler
+
+    handler = translation(request)
+    if handler is not None:
+        return handler
+
+    raise NotImplementedError("The model does not support speech-to-text APIs")
+
+
 @router.post(
     "/v1/audio/transcriptions",
     responses={
@@ -80,6 +92,13 @@ async def create_transcriptions(
         return JSONResponse(content=generator.model_dump())
 
     return StreamingResponse(content=generator, media_type="text/event-stream")
+
+
+@router.post("/reset_audio_microbatch_stats")
+async def reset_audio_microbatch_stats(raw_request: Request):
+    handler = speech_to_text_handler(raw_request)
+    result = handler.reset_async_audio_microbatch_stats()
+    return JSONResponse(content=result)
 
 
 @router.post(

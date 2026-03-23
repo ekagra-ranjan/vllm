@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
-import io
+import io   
+import os
 import math
 import time
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import AsyncGenerator, Callable
-from functools import cached_property
-from typing import Final, Literal, TypeAlias, TypeVar, cast
+from functools import cached_property, partial
+from typing import Any, Final, Literal, TypeAlias, TypeVar, cast
+from vllm.utils.torch_utils import set_default_torch_num_threads
 
 import numpy as np
 from fastapi import Request
@@ -88,6 +91,608 @@ ResponseType: TypeAlias = (
 logger = init_logger(__name__)
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+
+    return raw_value.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+HF_PROCESSOR_NUM_THREADS = int(os.environ.get("HF_PROCESSOR_NUM_THREADS", 1))        
+_CROSS_REQUEST_AUDIO_MICROBATCH_MAX_BATCH_SIZE = int(os.environ.get("CROSS_REQUEST_AUDIO_MICROBATCH_MAX_BATCH_SIZE", 16))
+_CROSS_REQUEST_AUDIO_MICROBATCH_WAIT_TIMEOUT_S = float(
+    os.environ.get("CROSS_REQUEST_AUDIO_MICROBATCH_WAIT_TIMEOUT_S", 0.002)
+)
+_CROSS_REQUEST_AUDIO_MICROBATCH_NUM_WORKERS = int(
+    os.environ.get("CROSS_REQUEST_AUDIO_MICROBATCH_NUM_WORKERS", 4)
+)
+_CROSS_REQUEST_AUDIO_MICROBATCH_MAX_TOTAL_TORCH_THREADS = int(
+    os.environ.get("CROSS_REQUEST_AUDIO_MICROBATCH_MAX_TOTAL_TORCH_THREADS", 64)
+)
+_ENABLE_ADAPTIVE_CROSS_REQUEST_AUDIO_MICROBATCH_DRAIN = _env_flag(
+    "VLLM_COHERE_ASR_CROSS_REQUEST_AUDIO_MICROBATCH_ADAPTIVE_DRAIN",
+    False,
+)
+_ENABLE_CROSS_REQUEST_AUDIO_MICROBATCH_BATCH_COORDINATOR = _env_flag(
+    "VLLM_COHERE_ASR_CROSS_REQUEST_AUDIO_MICROBATCH_BATCH_COORDINATOR",
+    True,
+)
+_CROSS_REQUEST_AUDIO_MICROBATCH_DRAIN_ENTER_THRESHOLD = int(
+    os.environ.get("CROSS_REQUEST_AUDIO_MICROBATCH_DRAIN_ENTER_THRESHOLD", 0)
+)
+_CROSS_REQUEST_AUDIO_MICROBATCH_DRAIN_EXIT_THRESHOLD = int(
+    os.environ.get("CROSS_REQUEST_AUDIO_MICROBATCH_DRAIN_EXIT_THRESHOLD", 0)
+)
+_CROSS_REQUEST_AUDIO_MICROBATCH_DRAIN_TARGET_BATCH_SIZE = int(
+    os.environ.get("CROSS_REQUEST_AUDIO_MICROBATCH_DRAIN_TARGET_BATCH_SIZE", 0)
+)
+
+
+def _resolve_async_audio_microbatch_topology(
+    *,
+    requested_num_workers: int,
+    requested_threads_per_worker: int,
+    max_total_torch_threads: int,
+) -> tuple[int, int]:
+    effective_max_total_torch_threads = max(1, max_total_torch_threads)
+    effective_num_workers = max(
+        1,
+        min(requested_num_workers, effective_max_total_torch_threads),
+    )
+    threads_per_worker = max(
+        1,
+        min(
+            requested_threads_per_worker,
+            effective_max_total_torch_threads // effective_num_workers,
+        ),
+    )
+    return effective_num_workers, threads_per_worker
+
+
+_ENABLE_CROSS_REQUEST_AUDIO_MICROBATCH = _env_flag(
+    "VLLM_COHERE_ASR_CROSS_REQUEST_AUDIO_MICROBATCH",
+    True,
+)
+_ENABLE_CROSS_REQUEST_AUDIO_MICROBATCH_STATS = _env_flag(
+    "VLLM_COHERE_ASR_CROSS_REQUEST_AUDIO_MICROBATCH_STATS",
+    False,
+)
+_CROSS_REQUEST_AUDIO_MICROBATCH_STATS_LOG_EVERY_BATCHES = int(
+    os.environ.get("CROSS_REQUEST_AUDIO_MICROBATCH_STATS_LOG_EVERY_BATCHES", 100)
+)
+
+
+class _AsyncMicrobatchStats:
+    def __init__(
+        self,
+        *,
+        max_batch_size: int,
+        log_every_batches: int,
+    ) -> None:
+        self.max_batch_size = max_batch_size
+        self.log_every_batches = max(1, log_every_batches)
+
+        array_size = max_batch_size + 1
+        self.batch_counts_by_size = [0] * array_size
+        self.item_counts_by_size = [0] * array_size
+        self.queue_wait_secs_by_size = [0.0] * array_size
+        self.preprocess_secs_by_size = [0.0] * array_size
+        self.max_queue_wait_secs_by_size = [0.0] * array_size
+        self.max_preprocess_secs_by_size = [0.0] * array_size
+
+        self.total_batches = 0
+        self.total_items = 0
+        self.total_queue_wait_secs = 0.0
+        self.total_preprocess_secs = 0.0
+        self.max_queue_wait_secs = 0.0
+        self.max_preprocess_secs = 0.0
+
+    def record(
+        self,
+        *,
+        batch_size: int,
+        total_queue_wait_secs: float,
+        max_queue_wait_secs: float,
+        preprocess_secs: float,
+    ) -> None:
+        self.total_batches += 1
+        self.total_items += batch_size
+        self.total_queue_wait_secs += total_queue_wait_secs
+        self.total_preprocess_secs += preprocess_secs
+        self.max_queue_wait_secs = max(self.max_queue_wait_secs, max_queue_wait_secs)
+        self.max_preprocess_secs = max(self.max_preprocess_secs, preprocess_secs)
+
+        self.batch_counts_by_size[batch_size] += 1
+        self.item_counts_by_size[batch_size] += batch_size
+        self.queue_wait_secs_by_size[batch_size] += total_queue_wait_secs
+        self.preprocess_secs_by_size[batch_size] += preprocess_secs
+        self.max_queue_wait_secs_by_size[batch_size] = max(
+            self.max_queue_wait_secs_by_size[batch_size],
+            max_queue_wait_secs,
+        )
+        self.max_preprocess_secs_by_size[batch_size] = max(
+            self.max_preprocess_secs_by_size[batch_size],
+            preprocess_secs,
+        )
+
+    def _format_bucket_summary(self) -> str:
+        parts = list[str]()
+        for batch_size in range(1, self.max_batch_size + 1):
+            batch_count = self.batch_counts_by_size[batch_size]
+            if batch_count == 0:
+                continue
+
+            item_count = self.item_counts_by_size[batch_size]
+            avg_queue_wait_ms = (
+                self.queue_wait_secs_by_size[batch_size] * 1000 / item_count
+            )
+            avg_preprocess_ms = (
+                self.preprocess_secs_by_size[batch_size] * 1000 / batch_count
+            )
+            max_queue_wait_ms = self.max_queue_wait_secs_by_size[batch_size] * 1000
+            max_preprocess_ms = self.max_preprocess_secs_by_size[batch_size] * 1000
+            parts.append(
+                "size=%d batches=%d avg_pre_ms=%.2f avg_qwait_ms=%.2f "
+                "max_pre_ms=%.2f max_qwait_ms=%.2f"
+                % (
+                    batch_size,
+                    batch_count,
+                    avg_preprocess_ms,
+                    avg_queue_wait_ms,
+                    max_preprocess_ms,
+                    max_queue_wait_ms,
+                )
+            )
+
+        return "; ".join(parts)
+
+    def summary(self) -> str:
+        avg_batch_size = (
+            self.total_items / self.total_batches if self.total_batches > 0 else 0.0
+        )
+        avg_queue_wait_ms = (
+            self.total_queue_wait_secs * 1000 / self.total_items
+            if self.total_items > 0
+            else 0.0
+        )
+        avg_preprocess_ms = (
+            self.total_preprocess_secs * 1000 / self.total_batches
+            if self.total_batches > 0
+            else 0.0
+        )
+
+        return (
+            "batches=%d items=%d avg_batch_size=%.2f avg_qwait_ms=%.2f "
+            "avg_pre_ms=%.2f max_qwait_ms=%.2f max_pre_ms=%.2f | %s"
+            % (
+                self.total_batches,
+                self.total_items,
+                avg_batch_size,
+                avg_queue_wait_ms,
+                avg_preprocess_ms,
+                self.max_queue_wait_secs * 1000,
+                self.max_preprocess_secs * 1000,
+                self._format_bucket_summary(),
+            )
+        )
+
+    def maybe_log(self, *, prefix: str = "Async audio microbatch stats") -> None:
+        if self.total_batches % self.log_every_batches == 0:
+            logger.info("%s: %s", prefix, self.summary())
+
+    def reset(self) -> str | None:
+        previous_summary = self.summary() if self.total_batches > 0 else None
+
+        array_size = self.max_batch_size + 1
+        self.batch_counts_by_size = [0] * array_size
+        self.item_counts_by_size = [0] * array_size
+        self.queue_wait_secs_by_size = [0.0] * array_size
+        self.preprocess_secs_by_size = [0.0] * array_size
+        self.max_queue_wait_secs_by_size = [0.0] * array_size
+        self.max_preprocess_secs_by_size = [0.0] * array_size
+
+        self.total_batches = 0
+        self.total_items = 0
+        self.total_queue_wait_secs = 0.0
+        self.total_preprocess_secs = 0.0
+        self.max_queue_wait_secs = 0.0
+        self.max_preprocess_secs = 0.0
+
+        return previous_summary
+
+class AsyncMicrobatchAudioPreprocessor:
+    """Microbatch single-clip requests across concurrent calls."""
+
+    def __init__(
+        self,
+        preprocess_fn: Callable[[list[np.ndarray], object], list[dict[str, Any]]],
+        model_config: object,
+        *,
+        preprocess_factory: (
+            Callable[[object], Callable[[list[np.ndarray]], list[dict[str, Any]]]] | None
+        ) = None,
+        num_workers: int = _CROSS_REQUEST_AUDIO_MICROBATCH_NUM_WORKERS,
+        num_threads: int = HF_PROCESSOR_NUM_THREADS,
+        max_batch_size: int = _CROSS_REQUEST_AUDIO_MICROBATCH_MAX_BATCH_SIZE,
+        batch_wait_timeout_s: float = _CROSS_REQUEST_AUDIO_MICROBATCH_WAIT_TIMEOUT_S,
+        max_total_torch_threads: int = (
+            _CROSS_REQUEST_AUDIO_MICROBATCH_MAX_TOTAL_TORCH_THREADS
+        ),
+    ) -> None:
+        self.preprocess_fn = preprocess_fn
+        self.model_config = model_config
+        self.preprocess_factory = preprocess_factory
+        self.requested_num_workers = max(1, num_workers)
+        self.requested_num_threads = max(1, num_threads)
+        self.max_total_torch_threads = max(1, max_total_torch_threads)
+        self.num_workers, self.num_threads = _resolve_async_audio_microbatch_topology(
+            requested_num_workers=self.requested_num_workers,
+            requested_threads_per_worker=self.requested_num_threads,
+            max_total_torch_threads=self.max_total_torch_threads,
+        )
+        self.max_batch_size = max_batch_size
+        self.batch_wait_timeout_s = batch_wait_timeout_s
+        self.adaptive_drain_enabled = (
+            _ENABLE_ADAPTIVE_CROSS_REQUEST_AUDIO_MICROBATCH_DRAIN
+        )
+        self.batch_coordinator_enabled = (
+            _ENABLE_CROSS_REQUEST_AUDIO_MICROBATCH_BATCH_COORDINATOR
+        )
+        default_drain_target_batch_size = max(
+            1,
+            (self.max_batch_size + self.num_workers - 1) // self.num_workers,
+        )
+        self.drain_target_batch_size = max(
+            1,
+            _CROSS_REQUEST_AUDIO_MICROBATCH_DRAIN_TARGET_BATCH_SIZE
+            or default_drain_target_batch_size,
+        )
+        self.drain_exit_threshold = max(
+            1,
+            _CROSS_REQUEST_AUDIO_MICROBATCH_DRAIN_EXIT_THRESHOLD
+            or self.drain_target_batch_size,
+        )
+        self.drain_enter_threshold = max(
+            self.drain_exit_threshold + 1,
+            _CROSS_REQUEST_AUDIO_MICROBATCH_DRAIN_ENTER_THRESHOLD
+            or self.max_batch_size,
+        )
+        self._drain_mode = False
+        self._worker_preprocess_fns: list[
+            Callable[[list[np.ndarray]], list[dict[str, Any]]] | None
+        ] = [None] * self.num_workers
+        self._stats = (
+            _AsyncMicrobatchStats(
+                max_batch_size=max_batch_size,
+                log_every_batches=_CROSS_REQUEST_AUDIO_MICROBATCH_STATS_LOG_EVERY_BATCHES,
+            )
+            if _ENABLE_CROSS_REQUEST_AUDIO_MICROBATCH_STATS
+            else None
+        )
+        self._stats_log_prefix = (
+            "Async audio microbatch stats "
+            f"(workers={self.num_workers}, "
+            f"torch_threads_per_worker={self.num_threads}, "
+            f"max_total_torch_threads={self.max_total_torch_threads})"
+        )
+        self._loop = asyncio.get_running_loop()
+        self._item_queue: asyncio.Queue[
+            tuple[np.ndarray, asyncio.Future[dict[str, Any]], float | None]
+        ] = asyncio.Queue()
+        self._batch_queue: asyncio.Queue[
+            list[tuple[np.ndarray, asyncio.Future[dict[str, Any]], float | None]]
+        ] | None = (
+            asyncio.Queue(maxsize=self.num_workers)
+            if self.batch_coordinator_enabled
+            else None
+        )
+        self._idle_worker_slots: asyncio.Semaphore | None = (
+            asyncio.Semaphore(self.num_workers)
+            if self.batch_coordinator_enabled
+            else None
+        )
+        self._executors = [
+            ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix=f"async-audio-microbatch-{worker_idx}",
+            )
+            for worker_idx in range(self.num_workers)
+        ]
+        self._coordinator_task = (
+            self._loop.create_task(self._coordinator_loop())
+            if self.batch_coordinator_enabled
+            else None
+        )
+        self._batcher_tasks = [
+            self._loop.create_task(self._batch_loop(worker_idx))
+            for worker_idx in range(self.num_workers)
+        ]
+        logger.info(
+            "Initialized async audio microbatch pool with %d workers, "
+            "%d torch threads per worker (requested workers=%d, "
+            "requested threads=%d, total cap=%d, adaptive_drain=%s, "
+            "batch_coordinator=%s, "
+            "drain_target_batch_size=%d, drain_enter_threshold=%d, "
+            "drain_exit_threshold=%d).",
+            self.num_workers,
+            self.num_threads,
+            self.requested_num_workers,
+            self.requested_num_threads,
+            self.max_total_torch_threads,
+            self.adaptive_drain_enabled,
+            self.batch_coordinator_enabled,
+            self.drain_target_batch_size,
+            self.drain_enter_threshold,
+            self.drain_exit_threshold,
+        )
+
+    async def preprocess(self, chunk: np.ndarray) -> dict[str, Any]:
+        result_future: asyncio.Future[dict[str, Any]] = self._loop.create_future()
+        enqueued_at = self._loop.time() if self._stats is not None else None
+        await self._item_queue.put((chunk, result_future, enqueued_at))
+        return await result_future
+
+    def reset_stats(self) -> dict[str, Any]:
+        self._drain_mode = False
+        if self._stats is None:
+            return {
+                "enabled": False,
+                "reset": False,
+                "summary_before_reset": None,
+            }
+
+        summary_before_reset = self._stats.reset()
+        return {
+            "enabled": True,
+            "reset": True,
+            "summary_before_reset": summary_before_reset,
+        }
+
+    def _resolve_batch_policy(self, queue_depth: int) -> tuple[int, float]:
+        if not self.adaptive_drain_enabled:
+            return self.max_batch_size, self.batch_wait_timeout_s
+
+        if not self._drain_mode and queue_depth >= self.drain_enter_threshold:
+            self._drain_mode = True
+        elif self._drain_mode and queue_depth <= self.drain_exit_threshold:
+            self._drain_mode = False
+
+        if self._drain_mode:
+            return self.drain_target_batch_size, 0.0
+
+        return self.max_batch_size, self.batch_wait_timeout_s
+
+    async def _fill_pending_items(
+        self,
+        pending_items: list[
+            tuple[np.ndarray, asyncio.Future[dict[str, Any]], float | None]
+        ],
+        *,
+        target_batch_size: int,
+        wait_timeout_s: float,
+    ) -> None:
+        if wait_timeout_s <= 0:
+            while len(pending_items) < target_batch_size:
+                try:
+                    pending_items.append(self._item_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            return
+
+        deadline = self._loop.time() + wait_timeout_s
+        while len(pending_items) < target_batch_size:
+            timeout = deadline - self._loop.time()
+            if timeout <= 0:
+                break
+            try:
+                pending_items.append(
+                    await asyncio.wait_for(self._item_queue.get(), timeout)
+                )
+            except asyncio.TimeoutError:
+                break
+
+    async def _coordinator_loop(self) -> None:
+        assert self._batch_queue is not None
+        assert self._idle_worker_slots is not None
+        pending_items: list[
+            tuple[np.ndarray, asyncio.Future[dict[str, Any]], float | None]
+        ] = []
+
+        while True:
+            slot_reserved = False
+            try:
+                if not pending_items:
+                    pending_items.append(await self._item_queue.get())
+
+                queue_depth = len(pending_items) + self._item_queue.qsize()
+                target_batch_size, effective_wait_timeout_s = (
+                    self._resolve_batch_policy(queue_depth)
+                )
+                await self._fill_pending_items(
+                    pending_items,
+                    target_batch_size=target_batch_size,
+                    wait_timeout_s=effective_wait_timeout_s,
+                )
+
+                # Do not remove items from the shared backlog until a worker
+                # slot is genuinely available; otherwise queued-but-not-running
+                # batches hide work from the coordinator's queue-depth policy.
+                await self._idle_worker_slots.acquire()
+                slot_reserved = True
+
+                queue_depth = len(pending_items) + self._item_queue.qsize()
+                target_batch_size, _ = self._resolve_batch_policy(queue_depth)
+                await self._fill_pending_items(
+                    pending_items,
+                    target_batch_size=target_batch_size,
+                    wait_timeout_s=0.0,
+                )
+
+                batch_size = min(len(pending_items), target_batch_size)
+                batch_items = pending_items[:batch_size]
+                pending_items = pending_items[batch_size:]
+                await self._batch_queue.put(batch_items)
+                slot_reserved = False
+            except asyncio.CancelledError as exc:
+                if slot_reserved:
+                    self._idle_worker_slots.release()
+                for _, future, _ in pending_items:
+                    if not future.done():
+                        future.set_exception(exc)
+                raise
+            except Exception as exc:
+                if slot_reserved:
+                    self._idle_worker_slots.release()
+                for _, future, _ in pending_items:
+                    if not future.done():
+                        future.set_exception(exc)
+                raise
+
+    async def _collect_batch_direct(
+        self,
+    ) -> tuple[
+        list[np.ndarray],
+        list[asyncio.Future[dict[str, Any]]],
+        list[float | None],
+    ]:
+        chunk, result_future, enqueued_at = await self._item_queue.get()
+        batch_items = [(chunk, result_future, enqueued_at)]
+
+        queue_depth = len(batch_items) + self._item_queue.qsize()
+        target_batch_size, effective_wait_timeout_s = self._resolve_batch_policy(
+            queue_depth
+        )
+        await self._fill_pending_items(
+            batch_items,
+            target_batch_size=target_batch_size,
+            wait_timeout_s=effective_wait_timeout_s,
+        )
+
+        chunks = [item_chunk for item_chunk, _, _ in batch_items]
+        result_futures = [future for _, future, _ in batch_items]
+        enqueued_ats = [item_enqueued_at for _, _, item_enqueued_at in batch_items]
+        return chunks, result_futures, enqueued_ats
+
+    def _ensure_worker_preprocess_fn(
+        self,
+        worker_idx: int,
+    ) -> Callable[[list[np.ndarray]], list[dict[str, Any]]]:
+        worker_preprocess_fn = self._worker_preprocess_fns[worker_idx]
+        if worker_preprocess_fn is None:
+            if self.preprocess_factory is None:
+                worker_preprocess_fn = partial(
+                    self.preprocess_fn,
+                    model_config=self.model_config,
+                )
+            else:
+                init_start = time.perf_counter()
+                worker_preprocess_fn = self.preprocess_factory(self.model_config)
+                init_ms = (time.perf_counter() - init_start) * 1000
+                logger.info(
+                    "Initialized async audio microbatch worker %d in %.2f ms.",
+                    worker_idx,
+                    init_ms,
+                )
+            self._worker_preprocess_fns[worker_idx] = worker_preprocess_fn
+
+        return worker_preprocess_fn
+
+    def _run_preprocess_batch(
+        self,
+        worker_idx: int,
+        chunks: list[np.ndarray],
+    ) -> list[dict[str, Any]]:
+        with set_default_torch_num_threads(self.num_threads):
+            worker_preprocess_fn = self._ensure_worker_preprocess_fn(worker_idx)
+            return worker_preprocess_fn(chunks)
+
+    async def _batch_loop(self, worker_idx: int) -> None:
+        executor = self._executors[worker_idx]
+        while True:
+            result_futures: list[asyncio.Future[dict[str, Any]]] = []
+            slot_reserved = False
+            try:
+                if self.batch_coordinator_enabled:
+                    assert self._batch_queue is not None
+                    batch_items = await self._batch_queue.get()
+                    slot_reserved = True
+                    chunks = [chunk for chunk, _, _ in batch_items]
+                    result_futures = [future for _, future, _ in batch_items]
+                    enqueued_ats = [enqueued_at for _, _, enqueued_at in batch_items]
+                else:
+                    chunks, result_futures, enqueued_ats = (
+                        await self._collect_batch_direct()
+                    )
+
+                batch_start = self._loop.time() if self._stats is not None else None
+                preprocess_start = (
+                    time.perf_counter() if self._stats is not None else None
+                )
+                preprocess_fn = partial(self._run_preprocess_batch, worker_idx, chunks)
+                results = await self._loop.run_in_executor(executor, preprocess_fn)
+                if (
+                    self._stats is not None
+                    and batch_start is not None
+                    and preprocess_start is not None
+                ):
+                    total_queue_wait_secs = 0.0
+                    max_queue_wait_secs = 0.0
+                    for item_enqueued_at in enqueued_ats:
+                        if item_enqueued_at is None:
+                            continue
+                        wait_secs = batch_start - item_enqueued_at
+                        total_queue_wait_secs += wait_secs
+                        if wait_secs > max_queue_wait_secs:
+                            max_queue_wait_secs = wait_secs
+
+                    self._stats.record(
+                        batch_size=len(chunks),
+                        total_queue_wait_secs=total_queue_wait_secs,
+                        max_queue_wait_secs=max_queue_wait_secs,
+                        preprocess_secs=time.perf_counter() - preprocess_start,
+                    )
+                    self._stats.maybe_log(prefix=self._stats_log_prefix)
+
+                for future, result in zip(result_futures, results):
+                    if not future.done():
+                        future.set_result(result)
+            except asyncio.CancelledError as exc:
+                for future in result_futures:
+                    if not future.done():
+                        future.set_exception(exc)
+                raise
+            except Exception as exc:
+                for future in result_futures:
+                    if not future.done():
+                        future.set_exception(exc)
+            finally:
+                if slot_reserved:
+                    assert self._idle_worker_slots is not None
+                    self._idle_worker_slots.release()
+
+    def __del__(self) -> None:
+        stats = getattr(self, "_stats", None)
+        if stats is not None and stats.total_batches > 0:
+            logger.info(
+                "Final %s: %s",
+                self._stats_log_prefix.lower(),
+                stats.summary(),
+            )
+        executors = getattr(self, "_executors", None)
+        if executors is not None:
+            for executor in executors:
+                executor.shutdown(wait=False, cancel_futures=True)
+        coordinator_task = getattr(self, "_coordinator_task", None)
+        batcher_tasks = getattr(self, "_batcher_tasks", None)
+        loop = getattr(self, "_loop", None)
+        if coordinator_task is not None and loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(coordinator_task.cancel)
+        if batcher_tasks is not None and loop is not None and not loop.is_closed():
+            for batcher_task in batcher_tasks:
+                loop.call_soon_threadsafe(batcher_task.cancel)
+
+
 class OpenAISpeechToText(OpenAIServing):
     """Base class for speech-to-text operations like transcription and
     translation."""
@@ -140,6 +745,67 @@ class OpenAISpeechToText(OpenAIServing):
 
         model_cls = get_model_cls(self.model_config)
         return cast(type[SupportsTranscription], model_cls)
+
+    @cached_property
+    def _async_audio_microbatch_topology(self) -> tuple[int, int]:
+        return _resolve_async_audio_microbatch_topology(
+            requested_num_workers=_CROSS_REQUEST_AUDIO_MICROBATCH_NUM_WORKERS,
+            requested_threads_per_worker=HF_PROCESSOR_NUM_THREADS,
+            max_total_torch_threads=(
+                _CROSS_REQUEST_AUDIO_MICROBATCH_MAX_TOTAL_TORCH_THREADS
+            ),
+        )
+
+    @cached_property
+    def _async_audio_preprocessor(self) -> AsyncMicrobatchAudioPreprocessor | None:
+        if not _ENABLE_CROSS_REQUEST_AUDIO_MICROBATCH:
+            return None
+
+        batch_preprocess_audio = getattr(
+            self.model_cls, "batch_preprocess_audio_chunks", None
+        )
+        if not callable(batch_preprocess_audio):
+            return None
+
+        preprocess_factory = getattr(
+            self.model_cls, "create_audio_microbatch_preprocessor", None
+        )
+        num_workers, num_threads = self._async_audio_microbatch_topology
+
+        return AsyncMicrobatchAudioPreprocessor(
+            batch_preprocess_audio,
+            self.model_config,
+            preprocess_factory=(
+                preprocess_factory if callable(preprocess_factory) else None
+            ),
+            num_workers=num_workers,
+            num_threads=num_threads,
+        )
+
+    def reset_async_audio_microbatch_stats(self) -> dict[str, Any]:
+        if not _ENABLE_CROSS_REQUEST_AUDIO_MICROBATCH:
+            return {
+                "available": False,
+                "reset": False,
+                "reason": "async_audio_microbatch_disabled",
+            }
+
+        preprocessor = self.__dict__.get("_async_audio_preprocessor")
+        if preprocessor is None:
+            return {
+                "available": True,
+                "reset": False,
+                "reason": "async_audio_microbatch_not_initialized",
+            }
+
+        assert isinstance(preprocessor, AsyncMicrobatchAudioPreprocessor)
+        reset_result = preprocessor.reset_stats()
+        return {
+            "available": True,
+            "reset": reset_result["reset"],
+            "stats_enabled": reset_result["enabled"],
+            "summary_before_reset": reset_result["summary_before_reset"],
+        }
 
     async def _detect_language(
         self,
@@ -265,8 +931,25 @@ class OpenAISpeechToText(OpenAIServing):
             )
             request.language = language
 
+        preprocessed_chunks = None
+        batch_preprocess_audio = getattr(
+            self.model_cls, "batch_preprocess_audio_chunks", None
+        )
+        if callable(batch_preprocess_audio):
+            _, microbatch_num_threads = self._async_audio_microbatch_topology
+            if len(chunks) > 1:
+                with set_default_torch_num_threads(microbatch_num_threads):
+                    preprocessed_chunks = batch_preprocess_audio(
+                        chunks,
+                        self.model_config,
+                    )
+            elif len(chunks) == 1 and self._async_audio_preprocessor is not None:
+                preprocessed_chunks = [
+                    await self._async_audio_preprocessor.preprocess(chunks[0])
+                ]
+
         parsed_prompts: list[DictPrompt] = []
-        for chunk in chunks:
+        for i, chunk in enumerate(chunks):
             # The model has control over the construction, as long as it
             # returns a valid PromptType.
             prompt = self.model_cls.get_generation_prompt(
@@ -278,6 +961,10 @@ class OpenAISpeechToText(OpenAIServing):
                 request_prompt=request.prompt,
                 to_language=to_language,
             )
+            if preprocessed_chunks is not None:
+                prompt["multi_modal_data"] = {
+                    "audio": preprocessed_chunks[i],
+                }
 
             parsed_prompt: DictPrompt
             if request.response_format == "verbose_json":

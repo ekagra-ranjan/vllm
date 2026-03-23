@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-from collections.abc import Iterable, Mapping, Sequence
-from typing import Literal, cast
+import time
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from typing import Any, Literal, cast
 
 import numpy as np
 import torch
@@ -32,12 +33,14 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
+    AudioItem,
     MultiModalDataDict,
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
 from vllm.multimodal.parse import (
     AudioProcessorItems,
+    ModalityDataItems,
     MultiModalDataItems,
     MultiModalDataParser,
 )
@@ -88,6 +91,108 @@ ISO639_1_SUPPORTED_LANGS = {
 
 import os
 _DEFAULT_COHERE_ASR_PREPROCESS_THREADS = 8
+_COHERE_ASR_MICROBATCH_PREPROCESS_DEVICE = os.environ.get(
+    "COHERE_ASR_MICROBATCH_PREPROCESS_DEVICE",
+    "cpu",
+).strip().lower()
+
+
+def _create_cohere_asr_feature_extractor(
+    model_config: ModelConfig,
+) -> CohereASRFeatureExtractor:
+    hf_config = model_config.hf_config
+    preproc = hf_config.preprocessor
+
+    sample_rate = preproc.get("sample_rate", 16000)
+    window_size = preproc.get("window_size", 0.02)
+    window_stride = preproc.get("window_stride", 0.01)
+
+    return CohereASRFeatureExtractor(
+        feature_size=preproc.get("features", 64),
+        sampling_rate=sample_rate,
+        padding_value=preproc.get("pad_value", 0.0),
+        max_duration=hf_config.max_audio_clip_s,
+        n_window_size=int(window_size * sample_rate),
+        n_window_stride=int(window_stride * sample_rate),
+        window=preproc.get("window", "hann"),
+        normalize=preproc.get("normalize", "per_feature"),
+        n_fft=preproc.get("n_fft", None),
+        preemph=preproc.get("preemph", 0.97),
+        lowfreq=preproc.get("lowfreq", 0),
+        highfreq=preproc.get("highfreq", None),
+        log=preproc.get("log", True),
+        log_zero_guard_type=preproc.get("log_zero_guard_type", "add"),
+        log_zero_guard_value=preproc.get("log_zero_guard_value", 2**-24),
+        dither=preproc.get("dither", 1e-05),
+        pad_to=preproc.get("pad_to", 16),
+        frame_splicing=preproc.get("frame_splicing", 1),
+        exact_pad=preproc.get("exact_pad", False),
+        mag_power=preproc.get("mag_power", 2.0),
+        mel_norm=preproc.get("mel_norm", "slaney"),
+        stft_exact_pad=preproc.get("stft_exact_pad", False),
+        stft_conv=preproc.get("stft_conv", False),
+        device=_COHERE_ASR_MICROBATCH_PREPROCESS_DEVICE,
+    )
+
+
+def _format_preprocessed_audio_chunks(
+    input_features: torch.Tensor,
+    length: torch.Tensor,
+    model_config: ModelConfig,
+) -> list[dict[str, torch.Tensor]]:
+    input_features = input_features.to(dtype=model_config.dtype)
+
+    subsampling_factor = model_config.hf_config.encoder["subsampling_factor"]
+    num_audio_tokens = torch.ceil(
+        length.to(dtype=torch.float32) / subsampling_factor
+    ).to(dtype=torch.int64)
+
+    return [
+        {
+            # Keep each request's preprocessed tensor trimmed to its own
+            # feature length so cross-request microbatching does not pin
+            # every item to the longest clip in the microbatch.
+            "input_features": input_features[i : i + 1, :, : int(length[i].item())],
+            "length": length[i : i + 1],
+            "num_audio_tokens": num_audio_tokens[i : i + 1],
+        }
+        for i in range(len(length))
+    ]
+
+
+class _PersistentCohereASRAudioBatchPreprocessor:
+    def __init__(self, model_config: ModelConfig) -> None:
+        init_start = time.perf_counter()
+        self.model_config = model_config
+        self.feature_extractor = _create_cohere_asr_feature_extractor(model_config)
+        self.preprocess_device = _COHERE_ASR_MICROBATCH_PREPROCESS_DEVICE
+        self.init_secs = time.perf_counter() - init_start
+        self._logged_first_batch = False
+
+    def __call__(self, chunks: list[np.ndarray]) -> list[dict[str, torch.Tensor]]:
+        extract_start = time.perf_counter()
+        input_features, length = self.feature_extractor.extract_features(
+            list(chunks),
+            to_cpu=True,
+        )
+        extract_ms = (time.perf_counter() - extract_start) * 1000
+
+        if not self._logged_first_batch:
+            logger.info(
+                "Persistent CohereASR preprocessor on %s init took %.2f ms; "
+                "first extract_features batch of size %d took %.2f ms.",
+                self.preprocess_device,
+                self.init_secs * 1000,
+                len(chunks),
+                extract_ms,
+            )
+            self._logged_first_batch = True
+
+        return _format_preprocessed_audio_chunks(
+            input_features,
+            length,
+            self.model_config,
+        )
 
 
 class CohereASRAttention(nn.Module):
@@ -1878,7 +1983,7 @@ class CohereASRProcessingInfo(BaseProcessingInfo):
 
     def get_data_parser(self) -> MultiModalDataParser:
         feature_extractor = self.get_feature_extractor()
-        return MultiModalDataParser(target_sr=feature_extractor.sampling_rate)
+        return CohereASRMultiModalDataParser(target_sr=feature_extractor.sampling_rate)
 
     def get_feature_extractor(self, **kwargs: object) -> CohereASRFeatureExtractor:
         hf_processor = self.get_hf_processor(**kwargs)
@@ -1918,6 +2023,53 @@ class CohereASRDummyInputsBuilder(BaseDummyInputsBuilder[CohereASRProcessingInfo
         }
 
 
+_COHERE_ASR_PREPROCESSED_AUDIO_FIELDS = {
+    "input_features": MultiModalFieldConfig.batched("audio"),
+    "length": MultiModalFieldConfig.batched("audio"),
+}
+
+
+class CohereASRPreprocessedAudioItems(
+    ModalityDataItems[Mapping[str, torch.Tensor], Mapping[str, torch.Tensor]]
+):
+    def __init__(self, data: Mapping[str, torch.Tensor]) -> None:
+        super().__init__(data, "audio")
+        self._kwargs = MultiModalKwargsItems.from_hf_inputs(
+            data,
+            _COHERE_ASR_PREPROCESSED_AUDIO_FIELDS,
+        )
+
+    def get_count(self) -> int:
+        return len(self._kwargs["audio"])
+
+    def get(self, index: int) -> Mapping[str, torch.Tensor]:
+        return self._kwargs["audio"][index].get_data()
+
+    def get_processor_data(self) -> Mapping[str, object]:
+        return {}
+
+    def get_passthrough_data(self) -> Mapping[str, object]:
+        return self.data
+
+
+class CohereASRMultiModalDataParser(MultiModalDataParser):
+    def _parse_audio_data(
+        self,
+        data: dict[str, torch.Tensor] | AudioItem,
+    ) -> ModalityDataItems[Any, Any] | None:
+        if isinstance(data, dict):
+            missing_fields = set(_COHERE_ASR_PREPROCESSED_AUDIO_FIELDS) - data.keys()
+            if missing_fields:
+                raise ValueError(
+                    "Missing preprocessed CohereASR audio fields: "
+                    f"{sorted(missing_fields)}"
+                )
+
+            return CohereASRPreprocessedAudioItems(data)
+
+        return super()._parse_audio_data(data)
+
+
 class CohereASRMultiModalProcessor(EncDecMultiModalProcessor[CohereASRProcessingInfo]):
     skip_decoder_start_token: bool = True
 
@@ -1933,6 +2085,7 @@ class CohereASRMultiModalProcessor(EncDecMultiModalProcessor[CohereASRProcessing
         return [0]
 
     def get_torch_num_threads(self, _inputs) -> int | None:
+        # TODO (ekagra): maybe add this to vllm envs?
         raw_value = os.getenv("VLLM_COHERE_ASR_PREPROCESS_THREADS")
         if raw_value is None:
             cpu_count = os.cpu_count() or _DEFAULT_COHERE_ASR_PREPROCESS_THREADS
@@ -1996,10 +2149,26 @@ class CohereASRMultiModalProcessor(EncDecMultiModalProcessor[CohereASRProcessing
         hf_processor_mm_kwargs: Mapping[str, object],
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
+        subsampling_factor = self.info.get_hf_config().encoder["subsampling_factor"]
+        out_audio_items = out_mm_kwargs.require_data().get("audio", [])
+
         def get_audio_replacement_cohere_asr(item_idx: int):
-            audios = mm_items.get_items("audio", AudioProcessorItems)
-            audio_len = audios.get_audio_length(item_idx)
-            num_tokens = self.info.get_num_audio_tokens(num_samples=audio_len)
+            if item_idx < len(out_audio_items):
+                out_audio_data = out_audio_items[item_idx].get_data()
+                feature_len = out_audio_data.get("length")
+                if not isinstance(feature_len, torch.Tensor):
+                    raise TypeError(
+                        "Expected tensor 'length' in CohereASR audio mm kwargs, "
+                        f"got {type(feature_len)}"
+                    )
+
+                num_tokens = math.ceil(
+                    feature_len.reshape(-1)[0].item() / subsampling_factor
+                )
+            else:
+                audios = mm_items.get_items("audio", AudioProcessorItems)
+                audio_len = audios.get_audio_length(item_idx)
+                num_tokens = self.info.get_num_audio_tokens(num_samples=audio_len)
             return [0] * num_tokens
 
         return [
@@ -2046,6 +2215,31 @@ class CohereASRForConditionalGeneration(
             )
             language = "en"
         return super().validate_language(language)
+
+    @classmethod
+    def batch_preprocess_audio_chunks(
+        cls,
+        chunks: Sequence[np.ndarray],
+        model_config: ModelConfig,
+    ) -> list[dict[str, torch.Tensor]]:
+        feature_extractor = _create_cohere_asr_feature_extractor(model_config)
+        input_features, length = feature_extractor.extract_features(
+            list(chunks),
+            to_cpu=True,
+        )
+        return _format_preprocessed_audio_chunks(
+            input_features,
+            length,
+            model_config,
+        )
+
+    @classmethod
+    def create_audio_microbatch_preprocessor(
+        cls,
+        model_config: ModelConfig,
+    ) -> Callable[[list[np.ndarray]], list[dict[str, torch.Tensor]]]:
+        preprocessor = _PersistentCohereASRAudioBatchPreprocessor(model_config)
+        return preprocessor
 
     @classmethod
     def get_generation_prompt(
