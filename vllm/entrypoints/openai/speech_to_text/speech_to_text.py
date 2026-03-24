@@ -8,6 +8,7 @@ import time
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import AsyncGenerator, Callable
+from dataclasses import dataclass
 from functools import cached_property, partial
 from typing import Any, Final, Literal, TypeAlias, TypeVar, cast
 from vllm.utils.torch_utils import set_default_torch_num_threads
@@ -118,6 +119,19 @@ _ENABLE_CROSS_REQUEST_AUDIO_MICROBATCH_BATCH_COORDINATOR = _env_flag(
     "VLLM_COHERE_ASR_CROSS_REQUEST_AUDIO_MICROBATCH_BATCH_COORDINATOR",
     True,
 )
+_ENABLE_CROSS_REQUEST_AUDIO_MICROBATCH_MULTI_STAGE_PIPELINE = _env_flag(
+    "VLLM_COHERE_ASR_CROSS_REQUEST_AUDIO_MICROBATCH_MULTI_STAGE_PIPELINE",
+    False,
+)
+_CROSS_REQUEST_AUDIO_MICROBATCH_PREP_NUM_WORKERS = int(
+    os.environ.get("CROSS_REQUEST_AUDIO_MICROBATCH_PREP_NUM_WORKERS", 0)
+)
+_CROSS_REQUEST_AUDIO_MICROBATCH_PREP_QUEUE_SIZE = int(
+    os.environ.get("CROSS_REQUEST_AUDIO_MICROBATCH_PREP_QUEUE_SIZE", 0)
+)
+_CROSS_REQUEST_AUDIO_MICROBATCH_READY_QUEUE_SIZE = int(
+    os.environ.get("CROSS_REQUEST_AUDIO_MICROBATCH_READY_QUEUE_SIZE", 0)
+)
 _CROSS_REQUEST_AUDIO_MICROBATCH_DRAIN_ENTER_THRESHOLD = int(
     os.environ.get("CROSS_REQUEST_AUDIO_MICROBATCH_DRAIN_ENTER_THRESHOLD", 0)
 )
@@ -126,6 +140,28 @@ _CROSS_REQUEST_AUDIO_MICROBATCH_DRAIN_EXIT_THRESHOLD = int(
 )
 _CROSS_REQUEST_AUDIO_MICROBATCH_DRAIN_TARGET_BATCH_SIZE = int(
     os.environ.get("CROSS_REQUEST_AUDIO_MICROBATCH_DRAIN_TARGET_BATCH_SIZE", 0)
+)
+_ENABLE_CROSS_REQUEST_AUDIO_MICROBATCH_READY_BACKLOG_GATING = _env_flag(
+    "VLLM_COHERE_ASR_CROSS_REQUEST_AUDIO_MICROBATCH_READY_BACKLOG_GATING",
+    False,
+)
+_CROSS_REQUEST_AUDIO_MICROBATCH_READY_BACKLOG_ENTER_THRESHOLD = int(
+    os.environ.get(
+        "CROSS_REQUEST_AUDIO_MICROBATCH_READY_BACKLOG_ENTER_THRESHOLD",
+        0,
+    )
+)
+_CROSS_REQUEST_AUDIO_MICROBATCH_READY_BACKLOG_EXIT_THRESHOLD = int(
+    os.environ.get(
+        "CROSS_REQUEST_AUDIO_MICROBATCH_READY_BACKLOG_EXIT_THRESHOLD",
+        0,
+    )
+)
+_CROSS_REQUEST_AUDIO_MICROBATCH_READY_BACKLOG_TARGET = int(
+    os.environ.get("CROSS_REQUEST_AUDIO_MICROBATCH_READY_BACKLOG_TARGET", 0)
+)
+_CROSS_REQUEST_AUDIO_MICROBATCH_READY_BACKLOG_MAX_WAIT_S = float(
+    os.environ.get("CROSS_REQUEST_AUDIO_MICROBATCH_READY_BACKLOG_MAX_WAIT_S", 0.0)
 )
 
 
@@ -148,6 +184,73 @@ def _resolve_async_audio_microbatch_topology(
         ),
     )
     return effective_num_workers, threads_per_worker
+
+
+def _resolve_async_audio_prep_workers(
+    *,
+    requested_num_workers: int,
+    fallback_num_workers: int,
+) -> int:
+    cpu_count = max(1, os.cpu_count() or 1)
+    if requested_num_workers > 0:
+        return max(1, min(requested_num_workers, cpu_count))
+    return max(1, min(max(4, fallback_num_workers), cpu_count))
+
+
+@dataclass
+class _PreparedAudioRequestHandle:
+    chunks: list[np.ndarray]
+    duration: float
+    preprocessed_chunks_future: asyncio.Future[list[dict[str, Any]]]
+
+
+@dataclass
+class _AsyncAudioRequestState:
+    chunks: list[np.ndarray]
+    duration: float
+    preprocessed_chunks_future: asyncio.Future[list[dict[str, Any]]]
+    pending_preprocessed_chunks: list[dict[str, Any] | None]
+    remaining_chunks: int
+
+
+@dataclass
+class _AsyncAudioPrepJob:
+    audio_data: bytes
+    handle_future: asyncio.Future[_PreparedAudioRequestHandle]
+    enqueued_at: float | None
+
+
+@dataclass
+class _AsyncAudioChunkWorkItem:
+    chunk: np.ndarray
+    enqueued_at: float | None
+    chunk_result_future: asyncio.Future[dict[str, Any]] | None = None
+    request_state: _AsyncAudioRequestState | None = None
+    chunk_index: int = 0
+
+
+@dataclass
+class _AsyncAudioChunkResult:
+    request_state: _AsyncAudioRequestState
+    chunk_index: int
+    preprocessed_chunk: dict[str, Any]
+
+
+@dataclass
+class _AsyncAudioPrepTiming:
+    decode_secs: float = 0.0
+    resample_secs: float = 0.0
+    chunk_secs: float = 0.0
+    used_pyav_fallback: bool = False
+    did_resample: bool = False
+    did_split: bool = False
+
+
+@dataclass
+class _PreparedAudioDecodeResult:
+    chunks: list[np.ndarray]
+    duration: float
+    timing: _AsyncAudioPrepTiming
 
 
 _ENABLE_CROSS_REQUEST_AUDIO_MICROBATCH = _env_flag(
@@ -301,14 +404,221 @@ class _AsyncMicrobatchStats:
 
         return previous_summary
 
+
+class _AsyncAudioPrepStageStats:
+    def __init__(self, *, log_every_requests: int) -> None:
+        self.log_every_requests = max(1, log_every_requests)
+        self.total_requests = 0
+        self.total_chunks = 0
+        self.total_prep_queue_wait_secs = 0.0
+        self.total_prepare_secs = 0.0
+        self.total_decode_secs = 0.0
+        self.total_resample_secs = 0.0
+        self.total_chunk_secs = 0.0
+        self.total_ready_queue_depth = 0
+        self.max_prep_queue_depth = 0
+        self.max_ready_queue_depth = 0
+        self.resampled_requests = 0
+        self.split_requests = 0
+        self.pyav_fallback_requests = 0
+
+    def note_prep_queue_depth(self, queue_depth: int) -> None:
+        self.max_prep_queue_depth = max(self.max_prep_queue_depth, queue_depth)
+
+    def note_ready_queue_depth(self, queue_depth: int) -> None:
+        self.max_ready_queue_depth = max(self.max_ready_queue_depth, queue_depth)
+
+    def record(
+        self,
+        *,
+        prep_queue_wait_secs: float,
+        prepare_secs: float,
+        prep_timing: _AsyncAudioPrepTiming,
+        num_chunks: int,
+        ready_queue_depth_after_emit: int,
+    ) -> None:
+        self.total_requests += 1
+        self.total_chunks += num_chunks
+        self.total_prep_queue_wait_secs += prep_queue_wait_secs
+        self.total_prepare_secs += prepare_secs
+        self.total_decode_secs += prep_timing.decode_secs
+        self.total_resample_secs += prep_timing.resample_secs
+        self.total_chunk_secs += prep_timing.chunk_secs
+        self.total_ready_queue_depth += ready_queue_depth_after_emit
+        self.max_ready_queue_depth = max(
+            self.max_ready_queue_depth,
+            ready_queue_depth_after_emit,
+        )
+        if prep_timing.did_resample:
+            self.resampled_requests += 1
+        if prep_timing.did_split:
+            self.split_requests += 1
+        if prep_timing.used_pyav_fallback:
+            self.pyav_fallback_requests += 1
+
+    def summary(self) -> str:
+        avg_chunks_per_request = (
+            self.total_chunks / self.total_requests if self.total_requests else 0.0
+        )
+        avg_prep_queue_wait_ms = (
+            self.total_prep_queue_wait_secs * 1000 / self.total_requests
+            if self.total_requests
+            else 0.0
+        )
+        avg_prepare_ms = (
+            self.total_prepare_secs * 1000 / self.total_requests
+            if self.total_requests
+            else 0.0
+        )
+        avg_decode_ms = (
+            self.total_decode_secs * 1000 / self.total_requests
+            if self.total_requests
+            else 0.0
+        )
+        avg_resample_ms = (
+            self.total_resample_secs * 1000 / self.total_requests
+            if self.total_requests
+            else 0.0
+        )
+        avg_chunk_ms = (
+            self.total_chunk_secs * 1000 / self.total_requests
+            if self.total_requests
+            else 0.0
+        )
+        avg_ready_queue_depth = (
+            self.total_ready_queue_depth / self.total_requests
+            if self.total_requests
+            else 0.0
+        )
+        return (
+            "requests=%d chunks=%d avg_chunks_per_request=%.2f "
+            "avg_prep_qwait_ms=%.2f avg_prepare_ms=%.2f "
+            "avg_decode_ms=%.2f avg_resample_ms=%.2f avg_chunk_ms=%.2f "
+            "avg_ready_depth=%.2f max_prep_depth=%d max_ready_depth=%d "
+            "resampled_requests=%d split_requests=%d pyav_fallback_requests=%d"
+            % (
+                self.total_requests,
+                self.total_chunks,
+                avg_chunks_per_request,
+                avg_prep_queue_wait_ms,
+                avg_prepare_ms,
+                avg_decode_ms,
+                avg_resample_ms,
+                avg_chunk_ms,
+                avg_ready_queue_depth,
+                self.max_prep_queue_depth,
+                self.max_ready_queue_depth,
+                self.resampled_requests,
+                self.split_requests,
+                self.pyav_fallback_requests,
+            )
+        )
+
+    def maybe_log(self, *, prefix: str) -> None:
+        if self.total_requests % self.log_every_requests == 0:
+            logger.info("%s: %s", prefix, self.summary())
+
+    def reset(self) -> str | None:
+        previous_summary = self.summary() if self.total_requests > 0 else None
+        self.total_requests = 0
+        self.total_chunks = 0
+        self.total_prep_queue_wait_secs = 0.0
+        self.total_prepare_secs = 0.0
+        self.total_decode_secs = 0.0
+        self.total_resample_secs = 0.0
+        self.total_chunk_secs = 0.0
+        self.total_ready_queue_depth = 0
+        self.max_prep_queue_depth = 0
+        self.max_ready_queue_depth = 0
+        self.resampled_requests = 0
+        self.split_requests = 0
+        self.pyav_fallback_requests = 0
+        return previous_summary
+
+
+def _decode_and_split_audio(
+    audio_data: bytes,
+    *,
+    asr_config: Any,
+) -> _PreparedAudioDecodeResult:
+    prep_timing = _AsyncAudioPrepTiming()
+    target_sr = asr_config.sample_rate
+
+    # Decode audio bytes. For container formats (MP4, M4A, WebM) that
+    # soundfile cannot detect from a BytesIO stream, librosa transparently
+    # falls back to ffmpeg via an in-memory fd.
+    # NOTE resample to model SR here for efficiency. This is also a
+    # pre-requisite for chunking, as it assumes Whisper SR.
+    try:
+        decode_start = time.perf_counter()
+        with io.BytesIO(audio_data) as buf:
+            y, sr = librosa.load(buf, sr=None)  # type: ignore[return-value]
+        prep_timing.decode_secs = time.perf_counter() - decode_start
+    except sf.LibsndfileError as exc:
+        if exc.code not in _BAD_SF_CODES:
+            raise
+        logger.debug(
+            "librosa/soundfile could not decode audio from BytesIO "
+            "(code=%s: %s); falling back to pyav in-process decode",
+            exc.code,
+            exc,
+        )
+        try:
+            prep_timing.used_pyav_fallback = True
+            decode_start = time.perf_counter()
+            y, sr = extract_audio_from_video_bytes(audio_data)
+            prep_timing.decode_secs = time.perf_counter() - decode_start
+        except Exception as pyav_exc:
+            logger.debug("pyAV fallback also failed: %s", pyav_exc)
+            raise ValueError("Invalid or unsupported audio file.") from pyav_exc
+
+    if int(sr) != int(target_sr):
+        resample_start = time.perf_counter()
+        y = librosa.resample(y, orig_sr=sr, target_sr=target_sr)
+        prep_timing.resample_secs = time.perf_counter() - resample_start
+        prep_timing.did_resample = True
+        sr = target_sr
+
+    chunk_start = time.perf_counter()
+    duration = librosa.get_duration(y=y, sr=sr)
+    do_split_audio = (
+        asr_config.allow_audio_chunking and duration > asr_config.max_audio_clip_s
+    )
+
+    if not do_split_audio:
+        prep_timing.chunk_secs = time.perf_counter() - chunk_start
+        return _PreparedAudioDecodeResult(
+            chunks=[y],
+            duration=duration,
+            timing=prep_timing,
+        )
+
+    assert asr_config.max_audio_clip_s is not None
+    assert asr_config.min_energy_split_window_size is not None
+    prep_timing.did_split = True
+    chunks = split_audio(
+        audio_data=y,
+        sample_rate=int(sr),
+        max_clip_duration_s=asr_config.max_audio_clip_s,
+        overlap_duration_s=asr_config.overlap_chunk_second,
+        min_energy_window_size=asr_config.min_energy_split_window_size,
+    )
+    prep_timing.chunk_secs = time.perf_counter() - chunk_start
+    return _PreparedAudioDecodeResult(
+        chunks=chunks,
+        duration=duration,
+        timing=prep_timing,
+    )
+
 class AsyncMicrobatchAudioPreprocessor:
-    """Microbatch single-clip requests across concurrent calls."""
+    """Microbatch audio preprocessing work across concurrent calls."""
 
     def __init__(
         self,
         preprocess_fn: Callable[[list[np.ndarray], object], list[dict[str, Any]]],
         model_config: object,
         *,
+        asr_config: object | None = None,
         preprocess_factory: (
             Callable[[object], Callable[[list[np.ndarray]], list[dict[str, Any]]]] | None
         ) = None,
@@ -322,6 +632,7 @@ class AsyncMicrobatchAudioPreprocessor:
     ) -> None:
         self.preprocess_fn = preprocess_fn
         self.model_config = model_config
+        self.asr_config = asr_config
         self.preprocess_factory = preprocess_factory
         self.requested_num_workers = max(1, num_workers)
         self.requested_num_threads = max(1, num_threads)
@@ -338,6 +649,14 @@ class AsyncMicrobatchAudioPreprocessor:
         )
         self.batch_coordinator_enabled = (
             _ENABLE_CROSS_REQUEST_AUDIO_MICROBATCH_BATCH_COORDINATOR
+        )
+        self.multi_stage_pipeline_enabled = (
+            _ENABLE_CROSS_REQUEST_AUDIO_MICROBATCH_MULTI_STAGE_PIPELINE
+            and self.asr_config is not None
+        )
+        self.num_prep_workers = _resolve_async_audio_prep_workers(
+            requested_num_workers=_CROSS_REQUEST_AUDIO_MICROBATCH_PREP_NUM_WORKERS,
+            fallback_num_workers=self.num_workers,
         )
         default_drain_target_batch_size = max(
             1,
@@ -358,7 +677,33 @@ class AsyncMicrobatchAudioPreprocessor:
             _CROSS_REQUEST_AUDIO_MICROBATCH_DRAIN_ENTER_THRESHOLD
             or self.max_batch_size,
         )
+        self.ready_backlog_gating_enabled = (
+            _ENABLE_CROSS_REQUEST_AUDIO_MICROBATCH_READY_BACKLOG_GATING
+            and self.batch_coordinator_enabled
+            and self.multi_stage_pipeline_enabled
+        )
+        self.ready_backlog_target = max(
+            1,
+            _CROSS_REQUEST_AUDIO_MICROBATCH_READY_BACKLOG_TARGET
+            or self.drain_target_batch_size,
+        )
+        self.ready_backlog_exit_threshold = max(
+            1,
+            _CROSS_REQUEST_AUDIO_MICROBATCH_READY_BACKLOG_EXIT_THRESHOLD
+            or self.drain_exit_threshold,
+        )
+        self.ready_backlog_enter_threshold = max(
+            self.ready_backlog_exit_threshold + 1,
+            _CROSS_REQUEST_AUDIO_MICROBATCH_READY_BACKLOG_ENTER_THRESHOLD
+            or self.drain_enter_threshold,
+        )
+        self.ready_backlog_max_wait_s = max(
+            0.0,
+            _CROSS_REQUEST_AUDIO_MICROBATCH_READY_BACKLOG_MAX_WAIT_S
+            or self.batch_wait_timeout_s,
+        )
         self._drain_mode = False
+        self._ready_backlog_gate_mode = False
         self._worker_preprocess_fns: list[
             Callable[[list[np.ndarray]], list[dict[str, Any]]] | None
         ] = [None] * self.num_workers
@@ -370,18 +715,53 @@ class AsyncMicrobatchAudioPreprocessor:
             if _ENABLE_CROSS_REQUEST_AUDIO_MICROBATCH_STATS
             else None
         )
+        self._prep_stats = (
+            _AsyncAudioPrepStageStats(
+                log_every_requests=_CROSS_REQUEST_AUDIO_MICROBATCH_STATS_LOG_EVERY_BATCHES,
+            )
+            if self.multi_stage_pipeline_enabled
+            and _ENABLE_CROSS_REQUEST_AUDIO_MICROBATCH_STATS
+            else None
+        )
         self._stats_log_prefix = (
             "Async audio microbatch stats "
             f"(workers={self.num_workers}, "
             f"torch_threads_per_worker={self.num_threads}, "
             f"max_total_torch_threads={self.max_total_torch_threads})"
         )
+        self._prep_stats_log_prefix = (
+            "Async audio prep stage stats "
+            f"(prep_workers={self.num_prep_workers}, "
+            f"workers={self.num_workers}, "
+            f"max_batch_size={self.max_batch_size})"
+        )
         self._loop = asyncio.get_running_loop()
-        self._item_queue: asyncio.Queue[
-            tuple[np.ndarray, asyncio.Future[dict[str, Any]], float | None]
-        ] = asyncio.Queue()
+        prep_queue_maxsize = (
+            _CROSS_REQUEST_AUDIO_MICROBATCH_PREP_QUEUE_SIZE
+            or max(1024, self.num_prep_workers * self.max_batch_size)
+        )
+        ready_queue_maxsize = (
+            _CROSS_REQUEST_AUDIO_MICROBATCH_READY_QUEUE_SIZE
+            or max(
+                1024,
+                max(self.num_prep_workers, self.num_workers) * self.max_batch_size,
+            )
+        )
+        self._prep_queue: asyncio.Queue[_AsyncAudioPrepJob] | None = (
+            asyncio.Queue(maxsize=prep_queue_maxsize)
+            if self.multi_stage_pipeline_enabled
+            else None
+        )
+        self._item_queue: asyncio.Queue[_AsyncAudioChunkWorkItem] = asyncio.Queue(
+            maxsize=ready_queue_maxsize if self.multi_stage_pipeline_enabled else 0
+        )
+        self._assemble_queue: asyncio.Queue[_AsyncAudioChunkResult] | None = (
+            asyncio.Queue(maxsize=ready_queue_maxsize)
+            if self.multi_stage_pipeline_enabled
+            else None
+        )
         self._batch_queue: asyncio.Queue[
-            list[tuple[np.ndarray, asyncio.Future[dict[str, Any]], float | None]]
+            list[_AsyncAudioChunkWorkItem]
         ] | None = (
             asyncio.Queue(maxsize=self.num_workers)
             if self.batch_coordinator_enabled
@@ -399,6 +779,27 @@ class AsyncMicrobatchAudioPreprocessor:
             )
             for worker_idx in range(self.num_workers)
         ]
+        self._prep_executor: ThreadPoolExecutor | None = (
+            ThreadPoolExecutor(
+                max_workers=self.num_prep_workers,
+                thread_name_prefix="async-audio-prep",
+            )
+            if self.multi_stage_pipeline_enabled
+            else None
+        )
+        self._prep_tasks = (
+            [
+                self._loop.create_task(self._prep_loop())
+                for _ in range(self.num_prep_workers)
+            ]
+            if self.multi_stage_pipeline_enabled
+            else []
+        )
+        self._assembly_task = (
+            self._loop.create_task(self._assembly_loop())
+            if self.multi_stage_pipeline_enabled
+            else None
+        )
         self._coordinator_task = (
             self._loop.create_task(self._coordinator_loop())
             if self.batch_coordinator_enabled
@@ -412,7 +813,10 @@ class AsyncMicrobatchAudioPreprocessor:
             "Initialized async audio microbatch pool with %d workers, "
             "%d torch threads per worker (requested workers=%d, "
             "requested threads=%d, total cap=%d, adaptive_drain=%s, "
-            "batch_coordinator=%s, "
+            "batch_coordinator=%s, multi_stage=%s, prep_workers=%d, "
+            "ready_backlog_gating=%s, ready_backlog_target=%d, "
+            "ready_backlog_enter_threshold=%d, ready_backlog_exit_threshold=%d, "
+            "ready_backlog_max_wait_s=%.4f, "
             "drain_target_batch_size=%d, drain_enter_threshold=%d, "
             "drain_exit_threshold=%d).",
             self.num_workers,
@@ -422,6 +826,13 @@ class AsyncMicrobatchAudioPreprocessor:
             self.max_total_torch_threads,
             self.adaptive_drain_enabled,
             self.batch_coordinator_enabled,
+            self.multi_stage_pipeline_enabled,
+            self.num_prep_workers,
+            self.ready_backlog_gating_enabled,
+            self.ready_backlog_target,
+            self.ready_backlog_enter_threshold,
+            self.ready_backlog_exit_threshold,
+            self.ready_backlog_max_wait_s,
             self.drain_target_batch_size,
             self.drain_enter_threshold,
             self.drain_exit_threshold,
@@ -429,24 +840,60 @@ class AsyncMicrobatchAudioPreprocessor:
 
     async def preprocess(self, chunk: np.ndarray) -> dict[str, Any]:
         result_future: asyncio.Future[dict[str, Any]] = self._loop.create_future()
-        enqueued_at = self._loop.time() if self._stats is not None else None
-        await self._item_queue.put((chunk, result_future, enqueued_at))
+        work_item = _AsyncAudioChunkWorkItem(
+            chunk=chunk,
+            enqueued_at=self._loop.time() if self._stats is not None else None,
+            chunk_result_future=result_future,
+        )
+        await self._item_queue.put(work_item)
+        if self._prep_stats is not None:
+            self._prep_stats.note_ready_queue_depth(self._item_queue.qsize())
         return await result_future
+
+    async def prepare(
+        self,
+        audio_data: bytes,
+    ) -> _PreparedAudioRequestHandle:
+        if not self.multi_stage_pipeline_enabled or self._prep_queue is None:
+            raise RuntimeError("multi-stage audio pipeline is not enabled")
+
+        handle_future: asyncio.Future[_PreparedAudioRequestHandle] = (
+            self._loop.create_future()
+        )
+        prep_job = _AsyncAudioPrepJob(
+            audio_data=audio_data,
+            handle_future=handle_future,
+            enqueued_at=self._loop.time() if self._prep_stats is not None else None,
+        )
+        await self._prep_queue.put(prep_job)
+        if self._prep_stats is not None:
+            self._prep_stats.note_prep_queue_depth(self._prep_queue.qsize())
+        return await handle_future
 
     def reset_stats(self) -> dict[str, Any]:
         self._drain_mode = False
-        if self._stats is None:
+        self._ready_backlog_gate_mode = False
+        if self._stats is None and self._prep_stats is None:
             return {
                 "enabled": False,
+                "prep_stats_enabled": False,
                 "reset": False,
                 "summary_before_reset": None,
+                "prep_summary_before_reset": None,
             }
 
-        summary_before_reset = self._stats.reset()
+        summary_before_reset = (
+            self._stats.reset() if self._stats is not None else None
+        )
+        prep_summary_before_reset = (
+            self._prep_stats.reset() if self._prep_stats is not None else None
+        )
         return {
-            "enabled": True,
+            "enabled": self._stats is not None,
+            "prep_stats_enabled": self._prep_stats is not None,
             "reset": True,
             "summary_before_reset": summary_before_reset,
+            "prep_summary_before_reset": prep_summary_before_reset,
         }
 
     def _resolve_batch_policy(self, queue_depth: int) -> tuple[int, float]:
@@ -465,9 +912,7 @@ class AsyncMicrobatchAudioPreprocessor:
 
     async def _fill_pending_items(
         self,
-        pending_items: list[
-            tuple[np.ndarray, asyncio.Future[dict[str, Any]], float | None]
-        ],
+        pending_items: list[_AsyncAudioChunkWorkItem],
         *,
         target_batch_size: int,
         wait_timeout_s: float,
@@ -492,12 +937,61 @@ class AsyncMicrobatchAudioPreprocessor:
             except asyncio.TimeoutError:
                 break
 
+    def _current_ready_backlog(self, pending_items_count: int) -> int:
+        return pending_items_count + self._item_queue.qsize()
+
+    def _current_pipeline_backlog(self, pending_items_count: int) -> int:
+        prep_backlog = self._prep_queue.qsize() if self._prep_queue is not None else 0
+        return prep_backlog + self._current_ready_backlog(pending_items_count)
+
+    def _update_ready_backlog_gate_mode(self, pending_items_count: int) -> bool:
+        if not self.ready_backlog_gating_enabled:
+            return False
+
+        pipeline_backlog = self._current_pipeline_backlog(pending_items_count)
+        if (
+            not self._ready_backlog_gate_mode
+            and pipeline_backlog >= self.ready_backlog_enter_threshold
+        ):
+            self._ready_backlog_gate_mode = True
+        elif (
+            self._ready_backlog_gate_mode
+            and pipeline_backlog <= self.ready_backlog_exit_threshold
+        ):
+            self._ready_backlog_gate_mode = False
+        return self._ready_backlog_gate_mode
+
+    async def _maybe_wait_for_ready_backlog(
+        self,
+        pending_items: list[_AsyncAudioChunkWorkItem],
+    ) -> None:
+        if not self._update_ready_backlog_gate_mode(len(pending_items)):
+            return
+        if self.ready_backlog_max_wait_s <= 0:
+            return
+
+        deadline = self._loop.time() + self.ready_backlog_max_wait_s
+        while self._update_ready_backlog_gate_mode(len(pending_items)):
+            if (
+                self._current_ready_backlog(len(pending_items))
+                >= self.ready_backlog_target
+            ):
+                return
+
+            remaining = deadline - self._loop.time()
+            if remaining <= 0:
+                return
+
+            await self._fill_pending_items(
+                pending_items,
+                target_batch_size=self.ready_backlog_target,
+                wait_timeout_s=remaining,
+            )
+
     async def _coordinator_loop(self) -> None:
         assert self._batch_queue is not None
         assert self._idle_worker_slots is not None
-        pending_items: list[
-            tuple[np.ndarray, asyncio.Future[dict[str, Any]], float | None]
-        ] = []
+        pending_items: list[_AsyncAudioChunkWorkItem] = []
 
         while True:
             slot_reserved = False
@@ -521,6 +1015,8 @@ class AsyncMicrobatchAudioPreprocessor:
                 await self._idle_worker_slots.acquire()
                 slot_reserved = True
 
+                await self._maybe_wait_for_ready_backlog(pending_items)
+
                 queue_depth = len(pending_items) + self._item_queue.qsize()
                 target_batch_size, _ = self._resolve_batch_policy(queue_depth)
                 await self._fill_pending_items(
@@ -537,27 +1033,20 @@ class AsyncMicrobatchAudioPreprocessor:
             except asyncio.CancelledError as exc:
                 if slot_reserved:
                     self._idle_worker_slots.release()
-                for _, future, _ in pending_items:
-                    if not future.done():
-                        future.set_exception(exc)
+                for pending_item in pending_items:
+                    self._set_work_item_exception(pending_item, exc)
                 raise
             except Exception as exc:
                 if slot_reserved:
                     self._idle_worker_slots.release()
-                for _, future, _ in pending_items:
-                    if not future.done():
-                        future.set_exception(exc)
+                for pending_item in pending_items:
+                    self._set_work_item_exception(pending_item, exc)
                 raise
 
     async def _collect_batch_direct(
         self,
-    ) -> tuple[
-        list[np.ndarray],
-        list[asyncio.Future[dict[str, Any]]],
-        list[float | None],
-    ]:
-        chunk, result_future, enqueued_at = await self._item_queue.get()
-        batch_items = [(chunk, result_future, enqueued_at)]
+    ) -> list[_AsyncAudioChunkWorkItem]:
+        batch_items = [await self._item_queue.get()]
 
         queue_depth = len(batch_items) + self._item_queue.qsize()
         target_batch_size, effective_wait_timeout_s = self._resolve_batch_policy(
@@ -568,11 +1057,131 @@ class AsyncMicrobatchAudioPreprocessor:
             target_batch_size=target_batch_size,
             wait_timeout_s=effective_wait_timeout_s,
         )
+        return batch_items
 
-        chunks = [item_chunk for item_chunk, _, _ in batch_items]
-        result_futures = [future for _, future, _ in batch_items]
-        enqueued_ats = [item_enqueued_at for _, _, item_enqueued_at in batch_items]
-        return chunks, result_futures, enqueued_ats
+    def _prepare_audio_request(
+        self,
+        audio_data: bytes,
+    ) -> _PreparedAudioDecodeResult:
+        if self.asr_config is None:
+            raise RuntimeError("multi-stage audio pipeline requires asr_config")
+        return _decode_and_split_audio(audio_data, asr_config=self.asr_config)
+
+    def _set_work_item_exception(
+        self,
+        work_item: _AsyncAudioChunkWorkItem,
+        exc: BaseException,
+    ) -> None:
+        if work_item.chunk_result_future is not None:
+            if not work_item.chunk_result_future.done():
+                work_item.chunk_result_future.set_exception(exc)
+            return
+
+        request_state = work_item.request_state
+        if (
+            request_state is not None
+            and not request_state.preprocessed_chunks_future.done()
+        ):
+            request_state.preprocessed_chunks_future.set_exception(exc)
+
+    async def _prep_loop(self) -> None:
+        if self._prep_queue is None or self._prep_executor is None:
+            return
+
+        while True:
+            prep_job = await self._prep_queue.get()
+            try:
+                prep_start_loop = self._loop.time() if self._prep_stats is not None else None
+                prep_start_perf = (
+                    time.perf_counter() if self._prep_stats is not None else None
+                )
+                prep_result = await self._loop.run_in_executor(
+                    self._prep_executor,
+                    partial(self._prepare_audio_request, prep_job.audio_data),
+                )
+                chunks = prep_result.chunks
+                duration = prep_result.duration
+                preprocessed_chunks_future: asyncio.Future[list[dict[str, Any]]] = (
+                    self._loop.create_future()
+                )
+                request_state = _AsyncAudioRequestState(
+                    chunks=chunks,
+                    duration=duration,
+                    preprocessed_chunks_future=preprocessed_chunks_future,
+                    pending_preprocessed_chunks=[None] * len(chunks),
+                    remaining_chunks=len(chunks),
+                )
+                if not prep_job.handle_future.done():
+                    prep_job.handle_future.set_result(
+                        _PreparedAudioRequestHandle(
+                            chunks=chunks,
+                            duration=duration,
+                            preprocessed_chunks_future=preprocessed_chunks_future,
+                        )
+                    )
+
+                max_ready_queue_depth = self._item_queue.qsize()
+                for idx, chunk in enumerate(chunks):
+                    work_item = _AsyncAudioChunkWorkItem(
+                        chunk=chunk,
+                        enqueued_at=self._loop.time() if self._stats is not None else None,
+                        request_state=request_state,
+                        chunk_index=idx,
+                    )
+                    await self._item_queue.put(work_item)
+                    max_ready_queue_depth = max(
+                        max_ready_queue_depth,
+                        self._item_queue.qsize(),
+                    )
+                    if self._prep_stats is not None:
+                        self._prep_stats.note_ready_queue_depth(self._item_queue.qsize())
+
+                if (
+                    self._prep_stats is not None
+                    and prep_start_loop is not None
+                    and prep_start_perf is not None
+                ):
+                    prep_queue_wait_secs = (
+                        prep_start_loop - prep_job.enqueued_at
+                        if prep_job.enqueued_at is not None
+                        else 0.0
+                    )
+                    self._prep_stats.record(
+                        prep_queue_wait_secs=prep_queue_wait_secs,
+                        prepare_secs=time.perf_counter() - prep_start_perf,
+                        prep_timing=prep_result.timing,
+                        num_chunks=len(chunks),
+                        ready_queue_depth_after_emit=max_ready_queue_depth,
+                    )
+                    self._prep_stats.maybe_log(prefix=self._prep_stats_log_prefix)
+            except asyncio.CancelledError as exc:
+                if not prep_job.handle_future.done():
+                    prep_job.handle_future.set_exception(exc)
+                raise
+            except Exception as exc:
+                if not prep_job.handle_future.done():
+                    prep_job.handle_future.set_exception(exc)
+
+    async def _assembly_loop(self) -> None:
+        if self._assemble_queue is None:
+            return
+
+        while True:
+            chunk_result = await self._assemble_queue.get()
+            request_state = chunk_result.request_state
+            if request_state.preprocessed_chunks_future.done():
+                continue
+
+            request_state.pending_preprocessed_chunks[chunk_result.chunk_index] = (
+                chunk_result.preprocessed_chunk
+            )
+            request_state.remaining_chunks -= 1
+            if request_state.remaining_chunks == 0:
+                completed_chunks = cast(
+                    list[dict[str, Any]],
+                    request_state.pending_preprocessed_chunks,
+                )
+                request_state.preprocessed_chunks_future.set_result(completed_chunks)
 
     def _ensure_worker_preprocess_fn(
         self,
@@ -610,20 +1219,18 @@ class AsyncMicrobatchAudioPreprocessor:
     async def _batch_loop(self, worker_idx: int) -> None:
         executor = self._executors[worker_idx]
         while True:
-            result_futures: list[asyncio.Future[dict[str, Any]]] = []
+            batch_items: list[_AsyncAudioChunkWorkItem] = []
             slot_reserved = False
             try:
                 if self.batch_coordinator_enabled:
                     assert self._batch_queue is not None
                     batch_items = await self._batch_queue.get()
                     slot_reserved = True
-                    chunks = [chunk for chunk, _, _ in batch_items]
-                    result_futures = [future for _, future, _ in batch_items]
-                    enqueued_ats = [enqueued_at for _, _, enqueued_at in batch_items]
                 else:
-                    chunks, result_futures, enqueued_ats = (
-                        await self._collect_batch_direct()
-                    )
+                    batch_items = await self._collect_batch_direct()
+
+                chunks = [item.chunk for item in batch_items]
+                enqueued_ats = [item.enqueued_at for item in batch_items]
 
                 batch_start = self._loop.time() if self._stats is not None else None
                 preprocess_start = (
@@ -654,18 +1261,30 @@ class AsyncMicrobatchAudioPreprocessor:
                     )
                     self._stats.maybe_log(prefix=self._stats_log_prefix)
 
-                for future, result in zip(result_futures, results):
-                    if not future.done():
-                        future.set_result(result)
+                for work_item, result in zip(batch_items, results):
+                    if work_item.chunk_result_future is not None:
+                        if not work_item.chunk_result_future.done():
+                            work_item.chunk_result_future.set_result(result)
+                        continue
+
+                    if (
+                        self._assemble_queue is not None
+                        and work_item.request_state is not None
+                    ):
+                        await self._assemble_queue.put(
+                            _AsyncAudioChunkResult(
+                                request_state=work_item.request_state,
+                                chunk_index=work_item.chunk_index,
+                                preprocessed_chunk=result,
+                            )
+                        )
             except asyncio.CancelledError as exc:
-                for future in result_futures:
-                    if not future.done():
-                        future.set_exception(exc)
+                for work_item in batch_items:
+                    self._set_work_item_exception(work_item, exc)
                 raise
             except Exception as exc:
-                for future in result_futures:
-                    if not future.done():
-                        future.set_exception(exc)
+                for work_item in batch_items:
+                    self._set_work_item_exception(work_item, exc)
             finally:
                 if slot_reserved:
                     assert self._idle_worker_slots is not None
@@ -679,15 +1298,32 @@ class AsyncMicrobatchAudioPreprocessor:
                 self._stats_log_prefix.lower(),
                 stats.summary(),
             )
+        prep_stats = getattr(self, "_prep_stats", None)
+        if prep_stats is not None and prep_stats.total_requests > 0:
+            logger.info(
+                "Final %s: %s",
+                self._prep_stats_log_prefix.lower(),
+                prep_stats.summary(),
+            )
         executors = getattr(self, "_executors", None)
         if executors is not None:
             for executor in executors:
                 executor.shutdown(wait=False, cancel_futures=True)
+        prep_executor = getattr(self, "_prep_executor", None)
+        if prep_executor is not None:
+            prep_executor.shutdown(wait=False, cancel_futures=True)
         coordinator_task = getattr(self, "_coordinator_task", None)
+        prep_tasks = getattr(self, "_prep_tasks", None)
+        assembly_task = getattr(self, "_assembly_task", None)
         batcher_tasks = getattr(self, "_batcher_tasks", None)
         loop = getattr(self, "_loop", None)
         if coordinator_task is not None and loop is not None and not loop.is_closed():
             loop.call_soon_threadsafe(coordinator_task.cancel)
+        if prep_tasks is not None and loop is not None and not loop.is_closed():
+            for prep_task in prep_tasks:
+                loop.call_soon_threadsafe(prep_task.cancel)
+        if assembly_task is not None and loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(assembly_task.cancel)
         if batcher_tasks is not None and loop is not None and not loop.is_closed():
             for batcher_task in batcher_tasks:
                 loop.call_soon_threadsafe(batcher_task.cancel)
@@ -775,6 +1411,7 @@ class OpenAISpeechToText(OpenAIServing):
         return AsyncMicrobatchAudioPreprocessor(
             batch_preprocess_audio,
             self.model_config,
+            asr_config=self.asr_config,
             preprocess_factory=(
                 preprocess_factory if callable(preprocess_factory) else None
             ),
@@ -804,7 +1441,9 @@ class OpenAISpeechToText(OpenAIServing):
             "available": True,
             "reset": reset_result["reset"],
             "stats_enabled": reset_result["enabled"],
+            "prep_stats_enabled": reset_result["prep_stats_enabled"],
             "summary_before_reset": reset_result["summary_before_reset"],
+            "prep_summary_before_reset": reset_result["prep_summary_before_reset"],
         }
 
     async def _detect_language(
@@ -872,70 +1511,46 @@ class OpenAISpeechToText(OpenAIServing):
                 parameter="audio_filesize_mb",
                 value=len(audio_data) / 1024**2,
             )
-
-        # Decode audio bytes.  For container formats (MP4, M4A, WebM) that
-        # soundfile cannot detect from a BytesIO stream, _load_audio_bytes
-        # transparently falls back to ffmpeg via an in-memory fd.
-        # NOTE resample to model SR here for efficiency. This is also a
-        # pre-requisite for chunking, as it assumes Whisper SR.
-        try:
-            with io.BytesIO(audio_data) as buf:
-                y, sr = librosa.load(buf, sr=self.asr_config.sample_rate)  # type: ignore[return-value]
-        except sf.LibsndfileError as exc:
-            # Only fall back for known format-detection failures.
-            # Re-raise anything else (e.g. corrupt but recognised format).
-            if exc.code not in _BAD_SF_CODES:
-                raise
-            logger.debug(
-                "librosa/soundfile could not decode audio from BytesIO "
-                "(code=%s: %s); falling back to pyav in-process decode",
-                exc.code,
-                exc,
-            )
-            try:
-                native_y, native_sr = extract_audio_from_video_bytes(audio_data)
-                sr = self.asr_config.sample_rate
-                y = librosa.resample(native_y, orig_sr=native_sr, target_sr=sr)
-            except Exception as pyav_exc:
-                logger.debug(
-                    "pyAV fallback also failed: %s",
-                    pyav_exc,
-                )
-                raise ValueError("Invalid or unsupported audio file.") from pyav_exc
-
-        duration = librosa.get_duration(y=y, sr=sr)
-        do_split_audio = (
-            self.asr_config.allow_audio_chunking
-            and duration > self.asr_config.max_audio_clip_s
-        )
-
-        if not do_split_audio:
-            chunks = [y]
-        else:
-            assert self.asr_config.max_audio_clip_s is not None
-            assert self.asr_config.min_energy_split_window_size is not None
-            chunks = split_audio(
-                audio_data=y,
-                sample_rate=int(sr),
-                max_clip_duration_s=self.asr_config.max_audio_clip_s,
-                overlap_duration_s=self.asr_config.overlap_chunk_second,
-                min_energy_window_size=self.asr_config.min_energy_split_window_size,
-            )
-
-        if language is None and getattr(
-            self.model_cls, "supports_explicit_language_detection", False
-        ):
-            # Auto-detect language from the first chunk.
-            language = await self._detect_language(
-                chunks[0], f"{request_id}-lang_detect"
-            )
-            request.language = language
-
-        preprocessed_chunks = None
         batch_preprocess_audio = getattr(
             self.model_cls, "batch_preprocess_audio_chunks", None
         )
-        if callable(batch_preprocess_audio):
+        preprocessed_chunks = None
+        if (
+            callable(batch_preprocess_audio)
+            and self._async_audio_preprocessor is not None
+            and self._async_audio_preprocessor.multi_stage_pipeline_enabled
+        ):
+            prepared_request = await self._async_audio_preprocessor.prepare(audio_data)
+            chunks = prepared_request.chunks
+            duration = prepared_request.duration
+
+            if language is None and getattr(
+                self.model_cls, "supports_explicit_language_detection", False
+            ):
+                language = await self._detect_language(
+                    chunks[0], f"{request_id}-lang_detect"
+                )
+                request.language = language
+
+            preprocessed_chunks = await prepared_request.preprocessed_chunks_future
+        else:
+            prep_result = _decode_and_split_audio(
+                audio_data,
+                asr_config=self.asr_config,
+            )
+            chunks = prep_result.chunks
+            duration = prep_result.duration
+
+            if language is None and getattr(
+                self.model_cls, "supports_explicit_language_detection", False
+            ):
+                # Auto-detect language from the first chunk.
+                language = await self._detect_language(
+                    chunks[0], f"{request_id}-lang_detect"
+                )
+                request.language = language
+
+        if callable(batch_preprocess_audio) and preprocessed_chunks is None:
             _, microbatch_num_threads = self._async_audio_microbatch_topology
             if len(chunks) > 1:
                 with set_default_torch_num_threads(microbatch_num_threads):
