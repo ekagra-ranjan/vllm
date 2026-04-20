@@ -451,6 +451,9 @@ class OpenAISpeechToText(OpenAIServing):
             self.default_sampling_params,
         )
 
+        # REMOVE (for benchmark)
+        # max_tokens = 5
+
         if request.use_beam_search:
             sampling_params = request.to_beam_search_params(
                 max_tokens, self.default_sampling_params
