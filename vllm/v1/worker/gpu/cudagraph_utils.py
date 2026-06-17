@@ -363,16 +363,16 @@ class CudaGraphManager:
                     effective_loras,
                 ):
                     # REMOVE
-                    print(
-                        f"uniform_token_count: {uniform_token_count}, \
-                        cg_mode: {desc.cg_mode}"
-                    )
+                    # print(
+                    #     f"uniform_token_count: {uniform_token_count}, \
+                    #     cg_mode: {desc.cg_mode}"
+                    # )
                     return desc
         # REMOVE
-        print(
-            f"uniform_token_count: {uniform_token_count}, \
-                cg_mode: {CUDAGraphMode.NONE}"
-        )
+        # print(
+        #     f"uniform_token_count: {uniform_token_count}, \
+        #         cg_mode: {CUDAGraphMode.NONE}"
+        # )
 
         return BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE,
