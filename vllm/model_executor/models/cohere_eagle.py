@@ -183,9 +183,15 @@ class EagleCohereForCausalLM(CohereForCausalLM):
         target_layer_num = vllm_config.model_config.get_num_layers(
             vllm_config.parallel_config
         )
+        # Name the draft layers with an ``eagle_draft`` marker so the hybrid
+        # KV-cache grouping in ``kv_cache_utils`` can keep all draft attention
+        # layers in a single group (required by the speculative proposer's
+        # ``validate_same_kv_cache_group`` check). Otherwise the draft's
+        # sliding-window layers share a spec with the target's sliding-window
+        # layers and get scattered across the target's KV-cache groups.
         self.model = CohereEagleModel(
             vllm_config=vllm_config,
-            prefix=maybe_prefix(prefix, "model"),
+            prefix=maybe_prefix(prefix, "eagle_draft_model"),
             start_layer_id=target_layer_num,
         )
 

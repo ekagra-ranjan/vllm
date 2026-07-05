@@ -1175,7 +1175,11 @@ def _get_kv_cache_groups_uniform_page_size(
     # -> (full.0, full.1), (sw.0, sw.1, sw.2).
     same_type_layers: dict[KVCacheSpec, list[str]] = defaultdict(list)
     for layer_name, layer_spec in kv_cache_spec.items():
-        same_type_layers[layer_spec].append(layer_name)
+        # Treat eagle_draft layers separately to avoid changing target model
+        # layer grouping (and the derived group size). They are collected into
+        # a single dedicated group below.
+        if "eagle_draft" not in layer_name:
+            same_type_layers[layer_spec].append(layer_name)
 
     # Split each group into smaller groups, to make the number of layers in each
     # group identical. Add padding to the last group of each type if necessary.
@@ -1202,6 +1206,19 @@ def _get_kv_cache_groups_uniform_page_size(
         # extra layers to one attention type.
         group_size = max_num_layers
     grouped_layers = []
+
+    # Collect eagle draft layers separately; they'll be inserted after the
+    # target model groups to avoid interleaving full-attention and
+    # sliding-window group ids (required by HybridKVCacheCoordinator).
+    draft_layer_group = [
+        layer_name for layer_name in kv_cache_spec if "eagle_draft" in layer_name
+    ]
+    if draft_layer_group:
+        assert len(draft_layer_group) <= group_size, (
+            "The number of draft layers must be less than the group size "
+            "to avoid too much padding in target model groups."
+        )
+
     for layers in same_type_layers.values():
         num_padding_layers = group_size - len(layers) % group_size
         if num_padding_layers != group_size:
@@ -1224,6 +1241,18 @@ def _get_kv_cache_groups_uniform_page_size(
         # instead of layers[i * group_size: (i + 1) * group_size]
         for i in range(num_groups):
             grouped_layers.append(layers[i::num_groups])
+
+    # Insert eagle draft group adjacent to target groups of the same
+    # attention type so that group ids of each type remain contiguous
+    # (required by HybridKVCacheCoordinator's non-interleaving check).
+    if draft_layer_group:
+        draft_spec_type = type(kv_cache_spec[draft_layer_group[0]])
+        insert_idx = 0
+        for idx, group in enumerate(grouped_layers):
+            if isinstance(kv_cache_spec[group[0]], draft_spec_type):
+                insert_idx = idx + 1
+        grouped_layers.insert(insert_idx, draft_layer_group)
+
     return create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
 
 
