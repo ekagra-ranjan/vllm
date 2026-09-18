@@ -3916,7 +3916,11 @@ Please generate the new code file in the "New file" section below."""  # noqa: E
                     prompt=prompt,
                     prompt_len=prompt_len,
                     expected_output_len=output_len,
-                    request_id=request_id_prefix + str(i),
+                    # Index into the kept subset, not into self.data: the
+                    # distance filter leaves gaps, and oversampling numbers its
+                    # extra requests from len(sampled_requests) onwards, so
+                    # sparse ids here would collide with them.
+                    request_id=request_id_prefix + str(len(sampled_requests)),
                 )
             )
         self.maybe_oversample_requests(
