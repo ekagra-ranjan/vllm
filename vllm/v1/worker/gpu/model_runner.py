@@ -281,7 +281,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # tokens during chunked prefill. Other speculators only read the immediate
         # next one.
         num_prefill_lookahead = (
-            self.num_speculative_steps
+            self.speculative_config.num_model_speculative_tokens()
             if self.speculative_config is not None
             and self.speculative_config.use_multi_module_mtp()
             else 1

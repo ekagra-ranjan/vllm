@@ -109,7 +109,7 @@ class DraftModelSpeculator(BaseSpeculator):
         assert vllm_config.speculative_config is not None
         self.speculative_config = vllm_config.speculative_config
         self.method = self.speculative_config.method
-        self.num_speculative_steps = self.speculative_config.num_speculative_tokens
+        self.num_speculative_steps = self.draft_num_speculative_steps()
         self.draft_model_config = self.speculative_config.draft_model_config
 
         self.scheduler_config = vllm_config.scheduler_config
@@ -202,6 +202,9 @@ class DraftModelSpeculator(BaseSpeculator):
 
         self.supports_mm_inputs = False
         self.pcp_manager: PCPManager | None = None
+
+    def draft_num_speculative_steps(self) -> int:
+        return self.speculative_config.num_speculative_tokens
 
     @abstractmethod
     def load_draft_model(

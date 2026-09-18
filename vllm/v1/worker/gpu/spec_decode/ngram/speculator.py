@@ -162,6 +162,7 @@ class NgramGPUSpeculator(BaseSpeculator):
         vllm_config: VllmConfig,
         device: torch.device,
         req_states: RequestState,
+        num_speculative_steps: int | None = None,
     ):
         if not HAS_TRITON:
             raise RuntimeError("ngram_gpu speculative decoding requires Triton.")
@@ -179,7 +180,12 @@ class NgramGPUSpeculator(BaseSpeculator):
         self.device = device
         self.req_states = req_states
         self.speculative_config = spec
-        self.num_speculative_steps: int = spec.num_speculative_tokens
+        # Hybrids give the n-gram half only its share of the total budget.
+        self.num_speculative_steps: int = (
+            num_speculative_steps
+            if num_speculative_steps is not None
+            else spec.num_speculative_tokens
+        )
 
         self.min_n: int = spec.prompt_lookup_min
         self.max_n: int = spec.prompt_lookup_max

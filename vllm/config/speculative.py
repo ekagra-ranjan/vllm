@@ -69,6 +69,14 @@ DSparkModelTypes = Literal["dspark"]
 EagleModelTypes = Literal[
     "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
 ]
+# Hybrid methods run the GPU n-gram drafter as first choice and a model-based
+# drafter as the fallback, so each request drafts a variable number of tokens.
+NgramHybridTypes = Literal[
+    "ngram-eagle",
+    "ngram-eagle3",
+    "ngram-mtp",
+    "ngram-dflash",
+]
 SpeculativeMethod = Literal[
     "ngram",
     "medusa",
@@ -79,6 +87,7 @@ SpeculativeMethod = Literal[
     EagleModelTypes,
     NgramGPUTypes,
     DSparkModelTypes,
+    NgramHybridTypes,
 ]
 RejectionSampleMethod = Literal["standard", "synthetic", "block"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
@@ -381,6 +390,14 @@ class SpeculativeConfig:
     num_speculative_tokens: int = Field(default=None, gt=0)  # type: ignore[assignment]
     """The number of speculative tokens, if provided. It will default to the
     number in the draft model config if present, otherwise, it is required."""
+    num_speculative_tokens_per_method: dict[str, int] | None = None
+    """Per-sub-method draft widths for hybrid methods, keyed by sub-method
+    name, e.g. `{"ngram": 5, "eagle": 3}` for `ngram-eagle`. Buffers are sized
+    for the widest drafter, so `num_speculative_tokens` defaults to the maximum
+    of these values."""
+    ngram_hybrid: bool = False
+    """Derived from a `ngram-<x>` method: run the GPU n-gram drafter as first
+    choice and `<x>` as the fallback."""
     model: str | None = None
     """The name of the draft model, eagle head, or additional weights, if
     provided."""
@@ -1118,6 +1135,14 @@ class SpeculativeConfig:
             else:
                 self.method = "draft_model"
 
+        # Normalize "ngram-<x>" to its model-side sub-method.
+        if self.method is not None and self.method.startswith("ngram-"):
+            self.ngram_hybrid = True
+            self.method = self.method.removeprefix("ngram-")  # type: ignore[assignment]
+
+        if self.num_speculative_tokens_per_method is not None:
+            self._validate_num_speculative_tokens_per_method()
+
         if self.method in get_args(MTPModelTypes) and self.method != "mtp":
             logger.warning(
                 "method `%s` is deprecated and replaced with mtp.", self.method
@@ -1172,7 +1197,7 @@ class SpeculativeConfig:
         if self.method in ("ngram", "[ngram]"):
             self.method = "ngram"
 
-        if self.method in ("ngram", "ngram_gpu"):
+        if self.use_ngram():
             # Set default values if not provided
             if self.prompt_lookup_min is None and self.prompt_lookup_max is None:
                 # TODO(woosuk): Tune these values. They are arbitrarily chosen.
@@ -1200,6 +1225,9 @@ class SpeculativeConfig:
                     f"be <= prompt_lookup_max={self.prompt_lookup_max}"
                 )
 
+        # A hybrid keeps going: its model half still needs a real draft model
+        # config, built by the `else` branch below.
+        if self.method in ("ngram", "ngram_gpu"):
             # TODO: current we still need extract vocab_size from target model
             # config, in future, we may try refactor it out, and set
             # draft related config as None here.
@@ -1248,8 +1276,9 @@ class SpeculativeConfig:
             self.draft_parallel_config = self.target_parallel_config
 
         else:
-            self.prompt_lookup_max = 0
-            self.prompt_lookup_min = 0
+            if not self.use_ngram():
+                self.prompt_lookup_max = 0
+                self.prompt_lookup_min = 0
 
             if self.model is not None:
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
@@ -1942,7 +1971,47 @@ class SpeculativeConfig:
         return self.method == "ngram_gpu"
 
     def use_ngram(self) -> bool:
-        return self.method in ("ngram", "ngram_gpu")
+        return self.method in ("ngram", "ngram_gpu") or self.ngram_hybrid
+
+    def _validate_num_speculative_tokens_per_method(self) -> None:
+        per_method = self.num_speculative_tokens_per_method
+        assert per_method is not None
+        if not self.ngram_hybrid:
+            raise ValueError(
+                "num_speculative_tokens_per_method only applies to hybrid "
+                f"methods; got method={self.method!r}."
+            )
+        expected = {"ngram", self.method}
+        if per_method.keys() != expected:
+            raise ValueError(
+                f"num_speculative_tokens_per_method must have keys {expected} "
+                f"for method 'ngram-{self.method}'; got {set(per_method)}."
+            )
+        if any(v < 1 for v in per_method.values()):
+            raise ValueError(
+                "num_speculative_tokens_per_method values must be positive; "
+                f"got {per_method}."
+            )
+        # Buffers are sized for the widest drafter.
+        widest = max(per_method.values())
+        if self.num_speculative_tokens is None:
+            self.num_speculative_tokens = widest
+        elif self.num_speculative_tokens != widest:
+            raise ValueError(
+                f"num_speculative_tokens={self.num_speculative_tokens} must "
+                f"equal max(num_speculative_tokens_per_method)={widest}, or be "
+                "left unset."
+            )
+
+    def num_ngram_speculative_tokens(self) -> int:
+        """Draft width of the n-gram half of a hybrid."""
+        per_method = self.num_speculative_tokens_per_method
+        return per_method["ngram"] if per_method else self.num_speculative_tokens
+
+    def num_model_speculative_tokens(self) -> int:
+        """Draft width of the model half."""
+        per_method = self.num_speculative_tokens_per_method
+        return per_method[self.method] if per_method else self.num_speculative_tokens
 
     def use_multi_module_mtp(self) -> bool:
         if self.method != "mtp" or self.draft_model_config is None:
@@ -1953,7 +2022,7 @@ class SpeculativeConfig:
         return min(num_mtp_layers, self.num_speculative_tokens) > 1
 
     def __repr__(self) -> str:
-        method = self.method
+        method = f"ngram-{self.method}" if self.ngram_hybrid else self.method
         model = (
             None
             if method
